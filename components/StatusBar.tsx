@@ -1,7 +1,13 @@
-import type { ConnectionDiagnostics, ConnectionStatus, Timeframe } from "@/types";
+import type {
+  ConnectionDiagnostics,
+  ConnectionStatus,
+  FootprintMode,
+  Timeframe,
+} from "@/types";
 
 interface StatusBarProps {
   status: ConnectionStatus;
+  mode: FootprintMode;
   symbol: string;
   timeframe: Timeframe;
   priceStep: number;
@@ -10,7 +16,10 @@ interface StatusBarProps {
   lastError?: string | null;
 }
 
-const STATUS_STYLES: Record<ConnectionStatus, { label: string; className: string }> = {
+const STATUS_STYLES: Record<
+  ConnectionStatus,
+  { label: string; className: string }
+> = {
   connecting: { label: "Connecting", className: "bg-yellow-400" },
   connected: { label: "Connected", className: "bg-emerald-500" },
   reconnecting: { label: "Reconnecting", className: "bg-orange-500" },
@@ -19,6 +28,7 @@ const STATUS_STYLES: Record<ConnectionStatus, { label: string; className: string
 
 export function StatusBar({
   status,
+  mode,
   symbol,
   timeframe,
   priceStep,
@@ -28,6 +38,8 @@ export function StatusBar({
 }: StatusBarProps) {
   const statusMeta = STATUS_STYLES[status];
   const offsetLabel = formatOffset(diagnostics.serverTimeOffsetMs);
+  const modeLabel = mode === "replay" ? "Replay" : "Live";
+  const modeClass = mode === "replay" ? "text-sky-200" : "text-emerald-200";
   const gapTimestamp = formatUtcTime(diagnostics.lastGapFillAt);
   const gapRange = formatRange(diagnostics.gapFrom, diagnostics.gapTo);
   const gapTrades = diagnostics.gapTradeCount;
@@ -36,8 +48,15 @@ export function StatusBar({
     <footer className="flex flex-col gap-1 rounded-lg border border-white/5 bg-black/30 px-4 py-3 text-sm text-white/70">
       <div className="flex flex-wrap items-center gap-3">
         <span className="flex items-center gap-2 font-medium text-white">
-          <span className={`inline-flex h-2.5 w-2.5 rounded-full ${statusMeta.className}`} aria-hidden />
+          <span
+            className={`inline-flex h-2.5 w-2.5 rounded-full ${statusMeta.className}`}
+            aria-hidden
+          />
           {statusMeta.label}
+        </span>
+        <span className="flex items-center gap-2">
+          <span className="font-semibold text-white/80">Mode</span>
+          <span className={`font-mono ${modeClass}`}>{modeLabel}</span>
         </span>
         <span className="hidden h-4 w-px bg-white/10 sm:block" aria-hidden />
         <span className="flex items-center gap-2">
@@ -50,7 +69,9 @@ export function StatusBar({
         </span>
         <span className="flex items-center gap-2">
           <span className="font-semibold text-white/80">Step</span>
-          <span className="font-mono text-white/60">{priceStep.toFixed(2)}</span>
+          <span className="font-mono text-white/60">
+            {priceStep.toFixed(2)}
+          </span>
         </span>
         <span className="flex items-center gap-2">
           <span className="font-semibold text-white/80">Bars</span>
@@ -63,14 +84,18 @@ export function StatusBar({
         </span>
         <span className="flex items-center gap-2">
           <span className="font-semibold text-white/80">Reconnects</span>
-          <span className="font-mono text-white/60">{diagnostics.reconnectAttempts}</span>
+          <span className="font-mono text-white/60">
+            {diagnostics.reconnectAttempts}
+          </span>
         </span>
       </div>
       {gapTimestamp ? (
         <p className="text-xs text-emerald-300/80">
           Gap filled {gapTimestamp} UTC
           {gapRange ? ` • span ${gapRange}` : ""}
-          {typeof gapTrades === "number" ? ` • ${gapTrades} trade${gapTrades === 1 ? "" : "s"}` : ""}
+          {typeof gapTrades === "number"
+            ? ` • ${gapTrades} trade${gapTrades === 1 ? "" : "s"}`
+            : ""}
         </p>
       ) : null}
       {lastError ? (
