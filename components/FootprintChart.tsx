@@ -2,7 +2,15 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { FootprintBar, FootprintSignal, HoverInfo, PendingTrade, Position } from "@/types";
+import type {
+  FootprintBar,
+  FootprintSignal,
+  HoverInfo,
+  InvalidationEvent,
+  InvalidationSeverity,
+  PendingTrade,
+  Position,
+} from "@/types";
 import { deltaToRgba } from "@/utils/color";
 import { precisionFromStep } from "@/lib/aggregator";
 
@@ -11,6 +19,7 @@ interface FootprintChartProps {
   signals: FootprintSignal[];
   positions: Position[];
   pendingTrades: PendingTrade[];
+  invalidations: InvalidationEvent[];
   priceStep: number;
   priceBounds: { min: number; max: number; maxVolume: number } | null;
   onHover: (hover: HoverInfo | null, position?: { x: number; y: number }) => void;
@@ -19,8 +28,13 @@ interface FootprintChartProps {
 const BACKGROUND = "#020617"; // slate-950
 const GRID_COLOR = "rgba(148, 163, 184, 0.06)";
 const POC_STROKE = "rgba(254, 240, 138, 0.9)";
+const INVALIDATION_COLORS: Record<InvalidationSeverity, { active: string; inactive: string }> = {
+  high: { active: "rgba(248, 113, 113, 0.9)", inactive: "rgba(248, 113, 113, 0.35)" },
+  medium: { active: "rgba(251, 191, 36, 0.9)", inactive: "rgba(251, 191, 36, 0.35)" },
+  low: { active: "rgba(56, 189, 248, 0.9)", inactive: "rgba(56, 189, 248, 0.35)" },
+};
 
-export function FootprintChart({ bars, signals, positions, pendingTrades, priceStep, priceBounds, onHover }: FootprintChartProps) {
+export function FootprintChart({ bars, signals, positions, pendingTrades, invalidations, priceStep, priceBounds, onHover }: FootprintChartProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const signalPositionsRef = useRef<
@@ -252,7 +266,48 @@ export function FootprintChart({ bars, signals, positions, pendingTrades, priceS
         }
       }
     }
-  }, [barIndexByTime, bars, pendingTrades, positions, priceBounds, priceStep, precision, signals, size.height, size.width]);
+
+    if (invalidations.length) {
+      for (const event of invalidations) {
+        const colorSet = INVALIDATION_COLORS[event.severity];
+        const color = event.positionOpen ? colorSet.active : colorSet.inactive;
+        let barIndex = -1;
+        if (typeof event.barIndex === "number" && event.barIndex >= 0) {
+          barIndex = event.barIndex;
+        } else if (event.barTime !== null) {
+          barIndex = barIndexByTime.get(event.barTime) ?? -1;
+        }
+        if (barIndex < 0 || barIndex >= bars.length) {
+          continue;
+        }
+
+        const levelPosition = (event.price - min) / priceStep;
+        if (!Number.isFinite(levelPosition)) {
+          continue;
+        }
+
+        const clampedLevel = Math.max(0, Math.min(levelCount - 1, levelPosition));
+        const x = barIndex * cellWidth + cellWidth / 2;
+        const y = size.height - (clampedLevel + 0.5) * cellHeight;
+        const radius = Math.max(3, Math.min(cellWidth, cellHeight) * 0.25);
+
+        context.beginPath();
+        context.fillStyle = color;
+        context.arc(x, y, radius, 0, Math.PI * 2);
+        context.fill();
+        context.strokeStyle = "rgba(2, 6, 23, 0.9)";
+        context.lineWidth = 1;
+        context.stroke();
+
+        context.save();
+        context.fillStyle = color;
+        context.font = "10px 'Inter', sans-serif";
+        context.textAlign = "center";
+        context.fillText(event.triggerLabel.toUpperCase(), x, y - radius - 4);
+        context.restore();
+      }
+    }
+  }, [barIndexByTime, bars, invalidations, pendingTrades, positions, priceBounds, priceStep, precision, signals, size.height, size.width]);
 
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
     if (!priceBounds || !bars.length) {

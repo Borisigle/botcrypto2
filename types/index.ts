@@ -76,6 +76,29 @@ export interface SignalEvidenceItem {
   value: string;
 }
 
+export type InvalidationTriggerId =
+  | "opposite-signal"
+  | "stacked-imbalance"
+  | "delta-poc-flip"
+  | "cumdelta-break"
+  | "key-level-recapture"
+  | "time-decay"
+  | "liquidity-sweep";
+
+export type InvalidationSeverity = "low" | "medium" | "high";
+
+export type InvalidationActionType = "close" | "reduce" | "hold" | "tighten-stop";
+
+export interface InvalidationActionOption {
+  type: InvalidationActionType;
+  label: string;
+}
+
+export interface InvalidationEvidenceItem {
+  label: string;
+  value: string;
+}
+
 export interface FootprintSignal {
   id: string;
   timestamp: number;
@@ -117,6 +140,48 @@ export interface SignalControlState {
   overrides: DetectorOverrides;
 }
 
+export interface InvalidationSettings {
+  aggressiveness: "strict" | "moderate" | "relaxed";
+  lookbackBars: number;
+  autoCloseHighSeverity: boolean;
+  autoCloseThreshold: number;
+  minOppositeSignalScore: number;
+  stackedImbalanceLevels: number;
+  stackedImbalanceRatio: number;
+  stackedImbalanceWindowSeconds: number;
+  minProgressR: number;
+  deltaFlipWindow: number;
+  cumDeltaLookback: number;
+  timeDecayMinutes: number;
+  liquiditySweepPercentile: number;
+  liquidityRetracePercent: number;
+  keyLevelDeltaThreshold: number;
+}
+
+export interface InvalidationEvent {
+  id: string;
+  positionId: string;
+  positionSide: SignalSide;
+  strategy: SignalStrategy;
+  triggerId: InvalidationTriggerId;
+  triggerLabel: string;
+  triggers: Array<{ id: InvalidationTriggerId; severity: number }>;
+  score: number;
+  severity: InvalidationSeverity;
+  evidence: InvalidationEvidenceItem[];
+  recommendation: string;
+  actions: InvalidationActionOption[];
+  timestamp: number;
+  session: TradingSession;
+  price: number;
+  barTime: number | null;
+  barIndex?: number | null;
+  autoClosed: boolean;
+  resolved: boolean;
+  actionTaken?: InvalidationActionType;
+  positionOpen: boolean;
+}
+
 export interface TradingSettings {
   autoTake: boolean;
   riskPerTradePercent: number;
@@ -127,6 +192,7 @@ export interface TradingSettings {
   retestWindowMinutes: number;
   beOffsetTicks: number;
   invalidationBars: number;
+  invalidations: InvalidationSettings;
 }
 
 export type TradeExitReason = "tp2" | "stop" | "breakeven" | "time-stop" | "invalidation" | "cancelled";
@@ -232,5 +298,6 @@ export interface TradingState {
   closed: ClosedTrade[];
   history: ClosedTrade[];
   daily: DailyPerformance;
+  invalidations: InvalidationEvent[];
   version: number;
 }

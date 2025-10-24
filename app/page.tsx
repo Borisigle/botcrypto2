@@ -35,6 +35,7 @@ export default function Page() {
     takeSignal,
     cancelPendingTrade,
     flattenPosition,
+    applyInvalidationAction,
     resetTradingDay,
     exportTradingHistory,
   } = useFootprint();
@@ -81,6 +82,7 @@ export default function Page() {
               signals={signals}
               positions={tradingState.positions}
               pendingTrades={tradingState.pending}
+              invalidations={tradingState.invalidations}
               priceStep={settings.priceStep}
               priceBounds={priceBounds}
               onHover={(info, position) => {
@@ -99,6 +101,7 @@ export default function Page() {
             onTakeSignal={takeSignal}
             onCancelPending={cancelPendingTrade}
             onFlattenPosition={flattenPosition}
+            onInvalidationAction={applyInvalidationAction}
           />
         </div>
 
