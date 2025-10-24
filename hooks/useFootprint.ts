@@ -2,7 +2,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { timeframeToMs } from "@/lib/aggregator";
 import { BinanceAggTradeStream } from "@/lib/binance";
+import { TradingEngine, DEFAULT_TRADING_SETTINGS } from "@/lib/trading/engine";
 import { createDefaultSignalControlState } from "@/lib/signals";
 import type {
   ConnectionStatus,
@@ -17,6 +19,8 @@ import type {
   SignalStrategy,
   Timeframe,
   Trade,
+  TradingSettings,
+  TradingState,
 } from "@/types";
 
 const DEFAULT_SETTINGS: Settings = {
@@ -29,6 +33,17 @@ const DEFAULT_SETTINGS: Settings = {
 
 const FLUSH_INTERVAL = 200;
 const SIGNAL_CONFIG_STORAGE_KEY = "footprint.signalConfig";
+const TRADING_SETTINGS_STORAGE_KEY = "footprint.trading.settings";
+const TRADING_HISTORY_STORAGE_KEY = "footprint.trading.history";
+
+const DEFAULT_TRADING_STATE: TradingState = (() => {
+  const engine = new TradingEngine({
+    priceStep: DEFAULT_SETTINGS.priceStep,
+    timeframeMs: timeframeToMs(DEFAULT_SETTINGS.timeframe),
+    settings: DEFAULT_TRADING_SETTINGS,
+  });
+  return engine.getState();
+})();
 
 const EMPTY_SIGNAL_STATS: SignalStats = {
   dailyCount: 0,
@@ -108,6 +123,7 @@ export function useFootprint() {
   );
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
   const [lastError, setLastError] = useState<string | null>(null);
+  const [tradingState, setTradingState] = useState<TradingState>(DEFAULT_TRADING_STATE);
 
   const handleStatusChange = useCallback((status: ConnectionStatus) => {
     setConnectionStatus(status);
@@ -117,6 +133,7 @@ export function useFootprint() {
   }, []);
 
   const signalControlRef = useRef<SignalControlState>(signalControl);
+  const tradingEngineRef = useRef<TradingEngine | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const workerReadyRef = useRef(false);
   const tradeBufferRef = useRef<Trade[]>([]);
@@ -136,10 +153,19 @@ export function useFootprint() {
     worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
       const message = event.data;
       if (message.type === "state") {
-        setBars(message.state.bars ?? []);
-        setSignals(message.state.signals ?? []);
+        const nextBars = message.state.bars ?? [];
+        const nextSignals = message.state.signals ?? [];
+        setBars(nextBars);
+        setSignals(nextSignals);
         setSignalStats(normalizeSignalStats(message.state.signalStats));
         setLastError(null);
+        const engine = tradingEngineRef.current;
+        if (engine) {
+          const updated = engine.syncSignals(nextSignals);
+          if (updated) {
+            setTradingState(engine.getState());
+          }
+        }
       } else if (message.type === "error") {
         setLastError(message.message);
       }
@@ -182,6 +208,51 @@ export function useFootprint() {
   }, []);
 
   useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    let storedSettings: Partial<TradingSettings> | undefined;
+    try {
+      const raw = window.localStorage.getItem(TRADING_SETTINGS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Partial<TradingSettings>;
+        if (parsed && typeof parsed === "object") {
+          storedSettings = parsed;
+        }
+      }
+    } catch (error) {
+      console.warn("Failed to restore trading settings", error);
+    }
+
+    let storedHistory: TradingState["history"] | undefined;
+    try {
+      const rawHistory = window.localStorage.getItem(TRADING_HISTORY_STORAGE_KEY);
+      if (rawHistory) {
+        const parsed = JSON.parse(rawHistory);
+        if (Array.isArray(parsed)) {
+          storedHistory = parsed as TradingState["history"];
+        }
+      }
+    } catch (error) {
+      console.warn("Failed to restore trading history", error);
+    }
+
+    const engine = new TradingEngine({
+      priceStep: DEFAULT_SETTINGS.priceStep,
+      timeframeMs: timeframeToMs(DEFAULT_SETTINGS.timeframe),
+      settings: storedSettings,
+      history: storedHistory,
+    });
+    tradingEngineRef.current = engine;
+    setTradingState(engine.getState());
+
+    return () => {
+      tradingEngineRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     signalControlRef.current = signalControl;
     if (typeof window !== "undefined") {
       try {
@@ -194,6 +265,17 @@ export function useFootprint() {
       workerRef.current.postMessage({ type: "detector-config", config: signalControl });
     }
   }, [signalControl]);
+
+  useEffect(() => {
+    const engine = tradingEngineRef.current;
+    if (!engine) {
+      return;
+    }
+    engine.updateMarketContext({
+      priceStep: settings.priceStep,
+      timeframeMs: timeframeToMs(settings.timeframe),
+    });
+  }, [settings.priceStep, settings.timeframe]);
 
   const flushTrades = useCallback(
     (force = false) => {
@@ -228,6 +310,13 @@ export function useFootprint() {
     const stream = new BinanceAggTradeStream(settings.symbol, {
       onTrade: (trade) => {
         tradeBufferRef.current.push(trade);
+        const engine = tradingEngineRef.current;
+        if (engine) {
+          const updated = engine.handleTrade(trade);
+          if (updated) {
+            setTradingState(engine.getState());
+          }
+        }
         if (tradeBufferRef.current.length >= 150) {
           flushTrades(true);
         } else if (flushTimerRef.current === null) {
@@ -366,6 +455,92 @@ export function useFootprint() {
     }));
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const engine = tradingEngineRef.current;
+    if (!engine) {
+      return;
+    }
+    const snapshot = engine.getPersistenceSnapshot();
+    try {
+      window.localStorage.setItem(TRADING_SETTINGS_STORAGE_KEY, JSON.stringify(snapshot.settings));
+    } catch (error) {
+      console.warn("Failed to persist trading settings", error);
+    }
+    try {
+      window.localStorage.setItem(TRADING_HISTORY_STORAGE_KEY, JSON.stringify(snapshot.history));
+    } catch (error) {
+      console.warn("Failed to persist trading history", error);
+    }
+  }, [tradingState.version]);
+
+  const updateTradingSettings = useCallback((partial: Partial<TradingSettings>) => {
+    const engine = tradingEngineRef.current;
+    if (!engine) {
+      return false;
+    }
+    const changed = engine.updateSettings(partial);
+    if (changed) {
+      setTradingState(engine.getState());
+    }
+    return changed;
+  }, []);
+
+  const takeSignal = useCallback((signalId: string) => {
+    const engine = tradingEngineRef.current;
+    if (!engine) {
+      return null;
+    }
+    const created = engine.takeSignal(signalId);
+    if (created) {
+      setTradingState(engine.getState());
+    }
+    return created;
+  }, []);
+
+  const cancelPendingTrade = useCallback((id: string) => {
+    const engine = tradingEngineRef.current;
+    if (!engine) {
+      return false;
+    }
+    const removed = engine.cancelPending(id);
+    if (removed) {
+      setTradingState(engine.getState());
+    }
+    return removed;
+  }, []);
+
+  const flattenPosition = useCallback((id: string, price?: number) => {
+    const engine = tradingEngineRef.current;
+    if (!engine) {
+      return false;
+    }
+    const closed = engine.flattenPosition(id, price);
+    if (closed) {
+      setTradingState(engine.getState());
+    }
+    return closed;
+  }, []);
+
+  const resetTradingDay = useCallback(() => {
+    const engine = tradingEngineRef.current;
+    if (!engine) {
+      return;
+    }
+    engine.resetDay();
+    setTradingState(engine.getState());
+  }, []);
+
+  const exportTradingHistory = useCallback((format: "json" | "csv" = "json") => {
+    const engine = tradingEngineRef.current;
+    if (!engine) {
+      return "";
+    }
+    return engine.exportHistory(format);
+  }, []);
+
   return {
     bars,
     signals,
@@ -382,5 +557,12 @@ export function useFootprint() {
     connectionStatus,
     priceBounds,
     lastError,
+    tradingState,
+    updateTradingSettings,
+    takeSignal,
+    cancelPendingTrade,
+    flattenPosition,
+    resetTradingDay,
+    exportTradingHistory,
   };
 }

@@ -1,22 +1,17 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 
 import { Controls } from "@/components/Controls";
 import { CumDeltaChart } from "@/components/CumDeltaChart";
 import { FootprintChart } from "@/components/FootprintChart";
 import { StatusBar } from "@/components/StatusBar";
+import { TradingControls } from "@/components/TradingControls";
+import { TradingPanel } from "@/components/TradingPanel";
 import { useFootprint } from "@/hooks/useFootprint";
-import { MODE_PRESETS } from "@/lib/signals";
-import type { FootprintSignal, HoverInfo, SignalStrategy } from "@/types";
+import type { HoverInfo } from "@/types";
 import { formatTimestamp } from "@/utils/color";
-
-const STRATEGY_LABELS: Record<SignalStrategy, string> = {
-  "absorption-failure": "Absorción + fallo",
-  "poc-migration": "Migración de POC",
-  "delta-divergence": "Divergencia delta",
-};
 
 export default function Page() {
   const {
@@ -35,12 +30,39 @@ export default function Page() {
     connectionStatus,
     priceBounds,
     lastError,
+    tradingState,
+    updateTradingSettings,
+    takeSignal,
+    cancelPendingTrade,
+    flattenPosition,
+    resetTradingDay,
+    exportTradingHistory,
   } = useFootprint();
 
   const [hover, setHover] = useState<HoverInfo | null>(null);
   const [tooltip, setTooltip] = useState<{ x: number; y: number } | null>(null);
 
   const activeBarTime = useMemo(() => (hover ? formatTimestamp(hover.time) : null), [hover]);
+
+  const handleExportHistory = useCallback(
+    (format: "json" | "csv") => {
+      const data = exportTradingHistory(format);
+      if (!data) {
+        return;
+      }
+      const blob = new Blob([data], {
+        type: format === "json" ? "application/json" : "text/csv",
+      });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      const dateStamp = new Date().toISOString().slice(0, 10);
+      anchor.download = `trading-history-${dateStamp}.${format}`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    },
+    [exportTradingHistory],
+  );
 
   return (
     <main className="flex min-h-screen flex-col gap-6 bg-slate-950 px-4 pb-8 pt-6 text-slate-100 md:px-8">
@@ -56,6 +78,9 @@ export default function Page() {
           <div className="relative flex-1 min-h-[400px] rounded-lg">
             <FootprintChart
               bars={bars}
+              signals={signals}
+              positions={tradingState.positions}
+              pendingTrades={tradingState.pending}
               priceStep={settings.priceStep}
               priceBounds={priceBounds}
               onHover={(info, position) => {
@@ -68,18 +93,36 @@ export default function Page() {
             ) : null}
           </div>
           {settings.showCumulativeDelta ? <CumDeltaChart bars={bars} /> : null}
+          <TradingPanel
+            signals={signals}
+            tradingState={tradingState}
+            onTakeSignal={takeSignal}
+            onCancelPending={cancelPendingTrade}
+            onFlattenPosition={flattenPosition}
+          />
         </div>
 
-        <aside className="w-full max-w-xs flex-none">
+        <aside className="w-full max-w-sm flex-none space-y-4">
           <Controls
             symbol={settings.symbol}
             timeframe={settings.timeframe}
             priceStep={settings.priceStep}
             showCumulativeDelta={settings.showCumulativeDelta}
+            signalControl={signalControl}
+            signalStats={signalStats}
             onSymbolChange={(symbol) => updateSettings({ symbol: symbol || "BTCUSDT" })}
             onTimeframeChange={setTimeframe}
             onPriceStepChange={setPriceStep}
             onToggleCumulativeDelta={toggleCumulativeDelta}
+            onModeChange={setSignalMode}
+            onToggleStrategy={toggleSignalStrategy}
+            onOverridesChange={updateSignalOverrides}
+          />
+          <TradingControls
+            settings={tradingState.settings}
+            onSettingsChange={updateTradingSettings}
+            onResetDay={resetTradingDay}
+            onExport={handleExportHistory}
           />
         </aside>
       </section>

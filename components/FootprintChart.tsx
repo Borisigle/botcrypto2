@@ -2,13 +2,15 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { FootprintBar, FootprintSignal, HoverInfo } from "@/types";
+import type { FootprintBar, FootprintSignal, HoverInfo, PendingTrade, Position } from "@/types";
 import { deltaToRgba } from "@/utils/color";
 import { precisionFromStep } from "@/lib/aggregator";
 
 interface FootprintChartProps {
   bars: FootprintBar[];
   signals: FootprintSignal[];
+  positions: Position[];
+  pendingTrades: PendingTrade[];
   priceStep: number;
   priceBounds: { min: number; max: number; maxVolume: number } | null;
   onHover: (hover: HoverInfo | null, position?: { x: number; y: number }) => void;
@@ -18,7 +20,7 @@ const BACKGROUND = "#020617"; // slate-950
 const GRID_COLOR = "rgba(148, 163, 184, 0.06)";
 const POC_STROKE = "rgba(254, 240, 138, 0.9)";
 
-export function FootprintChart({ bars, signals, priceStep, priceBounds, onHover }: FootprintChartProps) {
+export function FootprintChart({ bars, signals, positions, pendingTrades, priceStep, priceBounds, onHover }: FootprintChartProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const signalPositionsRef = useRef<
@@ -184,7 +186,73 @@ export function FootprintChart({ bars, signals, priceStep, priceBounds, onHover 
         signalPositionsRef.current.push({ id: signal.id, x, y, radius: radius + 4, signal });
       }
     }
-  }, [barIndexByTime, bars, priceBounds, priceStep, precision, signals, size.height, size.width]);
+
+    const priceToY = (price: number) => {
+      const levelPosition = (price - min) / priceStep;
+      if (!Number.isFinite(levelPosition)) {
+        return null;
+      }
+      const clamped = Math.max(0, Math.min(levelCount - 1, levelPosition));
+      return size.height - (clamped + 0.5) * cellHeight;
+    };
+
+    const drawLine = (y: number, color: string, width: number, dash?: number[]) => {
+      context.save();
+      if (dash) {
+        context.setLineDash(dash);
+      }
+      context.strokeStyle = color;
+      context.lineWidth = width;
+      context.beginPath();
+      context.moveTo(0, y);
+      context.lineTo(size.width, y);
+      context.stroke();
+      context.restore();
+    };
+
+    if (pendingTrades.length) {
+      for (const trade of pendingTrades) {
+        const y = priceToY(trade.entry);
+        if (y === null) {
+          continue;
+        }
+        const color = trade.side === "long" ? "rgba(16, 185, 129, 0.4)" : "rgba(248, 113, 113, 0.4)";
+        drawLine(y, color, 1, [6, 4]);
+      }
+    }
+
+    if (positions.length) {
+      for (const position of positions) {
+        const entryY = priceToY(position.entryPrice);
+        if (entryY !== null) {
+          const entryColor = position.side === "long" ? "rgba(16, 185, 129, 0.75)" : "rgba(248, 113, 113, 0.75)";
+          drawLine(entryY, entryColor, 1.6);
+        }
+
+        const stopY = priceToY(position.stopPrice);
+        if (stopY !== null) {
+          const nearBe = Math.abs(position.stopPrice - position.entryPrice) < priceStep * 0.25;
+          const stopColor =
+            nearBe && position.target1Hit
+              ? "rgba(250, 204, 21, 0.7)"
+              : position.side === "long"
+                ? "rgba(248, 113, 113, 0.55)"
+                : "rgba(16, 185, 129, 0.55)";
+          drawLine(stopY, stopColor, 1.2, [4, 4]);
+        }
+
+        const target1Y = priceToY(position.target1);
+        if (target1Y !== null) {
+          drawLine(target1Y, "rgba(59, 130, 246, 0.45)", 1, [2, 4]);
+        }
+
+        const target2Y = priceToY(position.target2);
+        if (target2Y !== null) {
+          drawLine(target2Y, "rgba(59, 130, 246, 0.7)", 1.4);
+        }
+      }
+    }
+  }, [barIndexByTime, bars, pendingTrades, positions, priceBounds, priceStep, precision, signals, size.height, size.width]);
 
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
     if (!priceBounds || !bars.length) {
