@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 
-import type { FootprintSignal, PendingTrade, Position, TradingState } from "@/types";
+import { InvalidationPanel } from "@/components/InvalidationPanel";
+import type { FootprintSignal, InvalidationActionType, PendingTrade, Position, TradingState } from "@/types";
 
 interface TradingPanelProps {
   signals: FootprintSignal[];
@@ -8,9 +9,10 @@ interface TradingPanelProps {
   onTakeSignal: (signalId: string) => void;
   onCancelPending: (id: string) => void;
   onFlattenPosition: (id: string) => void;
+  onInvalidationAction: (eventId: string, action: InvalidationActionType) => void;
 }
 
-export function TradingPanel({ signals, tradingState, onTakeSignal, onCancelPending, onFlattenPosition }: TradingPanelProps) {
+export function TradingPanel({ signals, tradingState, onTakeSignal, onCancelPending, onFlattenPosition, onInvalidationAction }: TradingPanelProps) {
   const { pending, positions, closed, settings, daily } = tradingState;
   const retestWindowMs = Math.max(0, settings.retestWindowMinutes) * 60_000;
   const now = Date.now();
@@ -35,6 +37,7 @@ export function TradingPanel({ signals, tradingState, onTakeSignal, onCancelPend
   const sortedPending = useMemo(() => [...pending].sort((a, b) => b.createdAt - a.createdAt), [pending]);
   const sortedPositions = useMemo(() => [...positions].sort((a, b) => b.entryTime - a.entryTime), [positions]);
   const recentClosed = useMemo(() => [...closed].slice(-8).reverse(), [closed]);
+  const sortedInvalidations = useMemo(() => [...tradingState.invalidations].sort((a, b) => b.timestamp - a.timestamp), [tradingState.invalidations]);
 
   return (
     <section className="flex flex-col gap-4">
@@ -47,6 +50,7 @@ export function TradingPanel({ signals, tradingState, onTakeSignal, onCancelPend
         <PendingCard pending={sortedPending} onCancelPending={onCancelPending} now={now} />
         <PositionsCard positions={sortedPositions} onFlattenPosition={onFlattenPosition} now={now} />
       </div>
+      <InvalidationPanel events={sortedInvalidations} onAction={onInvalidationAction} />
       <ClosedTradesCard trades={recentClosed} />
       <DailySummaryCard daily={daily} riskPercent={settings.riskPerTradePercent} />
     </section>

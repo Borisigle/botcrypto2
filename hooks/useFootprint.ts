@@ -12,6 +12,7 @@ import type {
   FootprintBar,
   FootprintSignal,
   FootprintState,
+  InvalidationActionType,
   Settings,
   SignalControlState,
   SignalMode,
@@ -161,7 +162,7 @@ export function useFootprint() {
         setLastError(null);
         const engine = tradingEngineRef.current;
         if (engine) {
-          const updated = engine.syncSignals(nextSignals);
+          const updated = engine.syncSignals(nextSignals, nextBars);
           if (updated) {
             setTradingState(engine.getState());
           }
@@ -524,6 +525,18 @@ export function useFootprint() {
     return closed;
   }, []);
 
+  const applyInvalidationAction = useCallback((eventId: string, action: InvalidationActionType) => {
+    const engine = tradingEngineRef.current;
+    if (!engine) {
+      return false;
+    }
+    const changed = engine.applyInvalidationAction(eventId, action);
+    if (changed) {
+      setTradingState(engine.getState());
+    }
+    return changed;
+  }, []);
+
   const resetTradingDay = useCallback(() => {
     const engine = tradingEngineRef.current;
     if (!engine) {
@@ -562,6 +575,7 @@ export function useFootprint() {
     takeSignal,
     cancelPendingTrade,
     flattenPosition,
+    applyInvalidationAction,
     resetTradingDay,
     exportTradingHistory,
   };
