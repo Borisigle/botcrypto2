@@ -3,7 +3,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { BinanceAggTradeStream } from "@/lib/binance";
-import type { Trade, FootprintBar, ConnectionStatus, Settings, Timeframe } from "@/types";
+import { createDefaultSignalControlState } from "@/lib/signals";
+import type {
+  ConnectionStatus,
+  DetectorOverrides,
+  FootprintBar,
+  FootprintSignal,
+  FootprintState,
+  Settings,
+  SignalControlState,
+  SignalMode,
+  SignalStats,
+  SignalStrategy,
+  Timeframe,
+  Trade,
+} from "@/types";
 
 const DEFAULT_SETTINGS: Settings = {
   symbol: "BTCUSDT",
@@ -14,6 +28,19 @@ const DEFAULT_SETTINGS: Settings = {
 };
 
 const FLUSH_INTERVAL = 200;
+const SIGNAL_CONFIG_STORAGE_KEY = "footprint.signalConfig";
+
+const EMPTY_SIGNAL_STATS: SignalStats = {
+  dailyCount: 0,
+  estimatePerDay: 0,
+  lastReset: 0,
+  sessionCount: {
+    asia: 0,
+    eu: 0,
+    us: 0,
+    other: 0,
+  },
+};
 
 interface PriceBounds {
   min: number;
@@ -23,7 +50,7 @@ interface PriceBounds {
 
 interface WorkerStateMessage {
   type: "state";
-  state: { bars: FootprintBar[] };
+  state: FootprintState;
 }
 
 interface WorkerErrorMessage {
@@ -33,9 +60,52 @@ interface WorkerErrorMessage {
 
 type WorkerMessage = WorkerStateMessage | WorkerErrorMessage;
 
+function mergeSignalControl(
+  base: SignalControlState,
+  partial: Partial<SignalControlState>,
+): SignalControlState {
+  return {
+    mode: partial.mode ?? base.mode,
+    enabledStrategies: {
+      ...base.enabledStrategies,
+      ...(partial.enabledStrategies ?? {}),
+    },
+    overrides: {
+      ...base.overrides,
+      ...(partial.overrides ?? {}),
+    },
+  };
+}
+
+function normalizeSignalStats(stats?: SignalStats): SignalStats {
+  if (!stats) {
+    return {
+      ...EMPTY_SIGNAL_STATS,
+      sessionCount: { ...EMPTY_SIGNAL_STATS.sessionCount },
+    };
+  }
+
+  return {
+    dailyCount: stats.dailyCount ?? 0,
+    estimatePerDay: stats.estimatePerDay ?? 0,
+    lastReset: stats.lastReset ?? 0,
+    sessionCount: {
+      asia: stats.sessionCount?.asia ?? 0,
+      eu: stats.sessionCount?.eu ?? 0,
+      us: stats.sessionCount?.us ?? 0,
+      other: stats.sessionCount?.other ?? 0,
+    },
+  };
+}
+
 export function useFootprint() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [bars, setBars] = useState<FootprintBar[]>([]);
+  const [signals, setSignals] = useState<FootprintSignal[]>([]);
+  const [signalStats, setSignalStats] = useState<SignalStats>(() => normalizeSignalStats());
+  const [signalControl, setSignalControl] = useState<SignalControlState>(() =>
+    createDefaultSignalControlState(),
+  );
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
   const [lastError, setLastError] = useState<string | null>(null);
 
@@ -46,6 +116,7 @@ export function useFootprint() {
     }
   }, []);
 
+  const signalControlRef = useRef<SignalControlState>(signalControl);
   const workerRef = useRef<Worker | null>(null);
   const workerReadyRef = useRef(false);
   const tradeBufferRef = useRef<Trade[]>([]);
@@ -65,7 +136,9 @@ export function useFootprint() {
     worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
       const message = event.data;
       if (message.type === "state") {
-        setBars(message.state.bars);
+        setBars(message.state.bars ?? []);
+        setSignals(message.state.signals ?? []);
+        setSignalStats(normalizeSignalStats(message.state.signalStats));
         setLastError(null);
       } else if (message.type === "error") {
         setLastError(message.message);
@@ -80,6 +153,7 @@ export function useFootprint() {
         maxBars: settings.maxBars,
       },
     });
+    worker.postMessage({ type: "detector-config", config: signalControlRef.current });
 
     workerReadyRef.current = true;
 
@@ -90,6 +164,36 @@ export function useFootprint() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    try {
+      const stored = window.localStorage.getItem(SIGNAL_CONFIG_STORAGE_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored) as Partial<SignalControlState>;
+        setSignalControl((prev) => mergeSignalControl(prev, parsed));
+      }
+    } catch (error) {
+      console.warn("Failed to restore signal config", error);
+    }
+  }, []);
+
+  useEffect(() => {
+    signalControlRef.current = signalControl;
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem(SIGNAL_CONFIG_STORAGE_KEY, JSON.stringify(signalControl));
+      } catch (error) {
+        console.warn("Failed to persist signal config", error);
+      }
+    }
+    if (workerRef.current && workerReadyRef.current) {
+      workerRef.current.postMessage({ type: "detector-config", config: signalControl });
+    }
+  }, [signalControl]);
 
   const flushTrades = useCallback(
     (force = false) => {
@@ -233,13 +337,48 @@ export function useFootprint() {
     }));
   }, []);
 
+  const setSignalMode = useCallback((mode: SignalMode) => {
+    setSignalControl((prev) => {
+      if (prev.mode === mode) {
+        return prev;
+      }
+      return { ...prev, mode };
+    });
+  }, []);
+
+  const toggleStrategy = useCallback((strategy: SignalStrategy) => {
+    setSignalControl((prev) => ({
+      ...prev,
+      enabledStrategies: {
+        ...prev.enabledStrategies,
+        [strategy]: !prev.enabledStrategies[strategy],
+      },
+    }));
+  }, []);
+
+  const updateSignalOverrides = useCallback((overrides: Partial<DetectorOverrides>) => {
+    setSignalControl((prev) => ({
+      ...prev,
+      overrides: {
+        ...prev.overrides,
+        ...overrides,
+      },
+    }));
+  }, []);
+
   return {
     bars,
+    signals,
+    signalStats,
+    signalControl,
     settings,
     updateSettings,
     setTimeframe,
     setPriceStep,
     toggleCumulativeDelta,
+    setSignalMode,
+    toggleStrategy,
+    updateSignalOverrides,
     connectionStatus,
     priceBounds,
     lastError,

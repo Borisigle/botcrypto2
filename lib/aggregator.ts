@@ -1,4 +1,13 @@
-import type { FootprintBar, FootprintState, LevelBin, Trade } from "@/types";
+import { SignalEngine, createDefaultSignalControlState } from "@/lib/signals";
+import type {
+  FootprintBar,
+  FootprintSignal,
+  FootprintState,
+  LevelBin,
+  SignalControlState,
+  SignalStats,
+  Trade,
+} from "@/types";
 
 export interface AggregatorSettings {
   timeframeMs: number;
@@ -20,6 +29,11 @@ interface InternalBar {
   totalDelta: number;
   pocPrice: number | null;
   pocVolume: number;
+  totalVolume: number;
+  highPrice: number;
+  lowPrice: number;
+  openPrice: number | null;
+  closePrice: number | null;
 }
 
 export function timeframeToMs(timeframe: string): number {
@@ -46,6 +60,20 @@ export function precisionFromStep(step: number): number {
 
 const EPSILON = 1e-9;
 
+function createInitialSignalStats(): SignalStats {
+  return {
+    dailyCount: 0,
+    sessionCount: {
+      asia: 0,
+      eu: 0,
+      us: 0,
+      other: 0,
+    },
+    estimatePerDay: 0,
+    lastReset: 0,
+  };
+}
+
 export function priceToBin(price: number, step: number, precision: number): number {
   const steps = Math.floor((price + EPSILON) / step);
   const binPrice = steps * step;
@@ -61,29 +89,70 @@ export class FootprintAggregator {
 
   private barMap = new Map<number, InternalBar>();
 
+  private signals: FootprintSignal[] = [];
+
+  private signalStats: SignalStats = createInitialSignalStats();
+
+  private signalEngine: SignalEngine;
+
+  private signalConfig: SignalControlState = createDefaultSignalControlState();
+
   constructor(settings: AggregatorSettings) {
     this.settings = { ...settings };
     this.precision = precisionFromStep(settings.priceStep);
+    this.signalEngine = new SignalEngine({
+      priceStep: settings.priceStep,
+      timeframeMs: settings.timeframeMs,
+      config: this.signalConfig,
+    });
   }
 
   updateSettings(partial: Partial<AggregatorSettings>, options?: { reset?: boolean }) {
     const nextSettings = { ...this.settings, ...partial } as AggregatorSettings;
     this.settings = nextSettings;
     this.precision = precisionFromStep(nextSettings.priceStep);
+    this.signalEngine.updateSettings({
+      priceStep: nextSettings.priceStep,
+      timeframeMs: nextSettings.timeframeMs,
+    });
 
     if (options?.reset) {
       this.reset();
+    } else {
+      this.signalEngine.reset();
+      this.recomputeSignals();
     }
+  }
+
+  updateSignalConfig(partial: Partial<SignalControlState>) {
+    this.signalConfig = {
+      mode: partial.mode ?? this.signalConfig.mode,
+      enabledStrategies: {
+        ...this.signalConfig.enabledStrategies,
+        ...(partial.enabledStrategies ?? {}),
+      },
+      overrides: {
+        ...this.signalConfig.overrides,
+        ...(partial.overrides ?? {}),
+      },
+    };
+    this.signalEngine.reset();
+    this.signalEngine.updateConfig(this.signalConfig);
+    this.recomputeSignals();
   }
 
   reset() {
     this.bars = [];
     this.barMap.clear();
+    this.signals = [];
+    this.signalStats = createInitialSignalStats();
+    this.signalEngine.reset();
   }
 
   ingestTrades(trades: Trade[]): FootprintState {
     if (!trades.length) {
-      return this.getState();
+      const bars = this.recomputeSignals();
+      return this.buildState(bars);
     }
 
     for (const trade of trades) {
@@ -92,10 +161,29 @@ export class FootprintAggregator {
 
     this.prune();
 
-    return this.getState();
+    const bars = this.recomputeSignals();
+    return this.buildState(bars);
   }
 
   getState(): FootprintState {
+    const bars = this.recomputeSignals();
+    return this.buildState(bars);
+  }
+
+  private buildState(bars: FootprintBar[]): FootprintState {
+    return {
+      bars,
+      signals: [...this.signals],
+      signalStats: {
+        dailyCount: this.signalStats.dailyCount,
+        estimatePerDay: this.signalStats.estimatePerDay,
+        lastReset: this.signalStats.lastReset,
+        sessionCount: { ...this.signalStats.sessionCount },
+      },
+    };
+  }
+
+  private serializeBars(): FootprintBar[] {
     const bars: FootprintBar[] = [];
     let cumulative = 0;
 
@@ -113,6 +201,16 @@ export class FootprintAggregator {
           totalVolume: Number(level.totalVolume.toFixed(6)),
         }));
 
+      const defaultPrice = levels.length ? levels[0].price : 0;
+      const openPrice = Number.isFinite(bar.openPrice ?? NaN) ? (bar.openPrice as number) : defaultPrice;
+      const closePrice = Number.isFinite(bar.closePrice ?? NaN)
+        ? (bar.closePrice as number)
+        : Number.isFinite(bar.openPrice ?? NaN)
+          ? (bar.openPrice as number)
+          : defaultPrice;
+      const highPrice = Number.isFinite(bar.highPrice) ? bar.highPrice : Math.max(defaultPrice, closePrice);
+      const lowPrice = Number.isFinite(bar.lowPrice) ? bar.lowPrice : Math.min(defaultPrice, closePrice);
+
       bars.push({
         startTime: bar.startTime,
         endTime: bar.endTime,
@@ -121,10 +219,23 @@ export class FootprintAggregator {
         pocVolume: Number(bar.pocVolume.toFixed(6)),
         totalDelta: Number(bar.totalDelta.toFixed(6)),
         cumulativeDelta: Number(cumulative.toFixed(6)),
+        totalVolume: Number(bar.totalVolume.toFixed(6)),
+        highPrice: Number(highPrice.toFixed(6)),
+        lowPrice: Number(lowPrice.toFixed(6)),
+        openPrice: Number(openPrice.toFixed(6)),
+        closePrice: Number(closePrice.toFixed(6)),
       });
     }
 
-    return { bars };
+    return bars;
+  }
+
+  private recomputeSignals(): FootprintBar[] {
+    const bars = this.serializeBars();
+    const { signals, stats } = this.signalEngine.process(bars);
+    this.signals = signals;
+    this.signalStats = stats;
+    return bars;
   }
 
   private processTrade(trade: Trade) {
@@ -133,6 +244,14 @@ export class FootprintAggregator {
     const barStart = Math.floor(trade.timestamp / timeframeMs) * timeframeMs;
     const barEnd = barStart + timeframeMs;
     const bar = this.getOrCreateBar(barStart, barEnd);
+
+    if (bar.openPrice === null) {
+      bar.openPrice = trade.price;
+    }
+    bar.closePrice = trade.price;
+    bar.highPrice = Math.max(bar.highPrice, trade.price);
+    bar.lowPrice = Math.min(bar.lowPrice, trade.price);
+    bar.totalVolume += trade.quantity;
 
     const levelPrice = priceToBin(trade.price, priceStep, this.precision);
     let level = bar.levels.get(levelPrice);
@@ -180,6 +299,11 @@ export class FootprintAggregator {
       totalDelta: 0,
       pocPrice: null,
       pocVolume: 0,
+      totalVolume: 0,
+      highPrice: Number.NEGATIVE_INFINITY,
+      lowPrice: Number.POSITIVE_INFINITY,
+      openPrice: null,
+      closePrice: null,
     };
 
     this.barMap.set(startTime, bar);
