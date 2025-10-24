@@ -1,14 +1,20 @@
-import type { ConnectionStatus, Trade } from "@/types";
+import type { ConnectionStatus, SymbolMarketConfig, Trade } from "@/types";
 
 const STREAM_BASE = "wss://fstream.binance.com/stream?streams=";
+const REST_BASE = "https://fapi.binance.com/fapi/v1";
+const MAX_BACKOFF = 30_000;
+const MAX_AGG_TRADE_LIMIT = 1000;
+
+export interface StreamStatusMeta {
+  attempts?: number;
+  nextRetryMs?: number;
+}
 
 export interface StreamHandlers {
   onTrade: (trade: Trade) => void;
-  onStatusChange?: (status: ConnectionStatus) => void;
+  onStatusChange?: (status: ConnectionStatus, meta?: StreamStatusMeta) => void;
   onError?: (message: string) => void;
 }
-
-const MAX_BACKOFF = 30_000;
 
 export class BinanceAggTradeStream {
   private ws: WebSocket | null = null;
@@ -40,11 +46,12 @@ export class BinanceAggTradeStream {
     this.clearTimer();
     this.ws?.close();
     this.ws = null;
-    this.setStatus("disconnected");
+    this.setStatus("disconnected", { attempts: this.reconnectAttempts });
   }
 
   private openConnection() {
-    this.setStatus(this.reconnectAttempts === 0 ? "connecting" : "reconnecting");
+    const phase: ConnectionStatus = this.reconnectAttempts === 0 ? "connecting" : "reconnecting";
+    this.setStatus(phase, { attempts: this.reconnectAttempts });
 
     try {
       this.ws = new WebSocket(this.url);
@@ -54,8 +61,9 @@ export class BinanceAggTradeStream {
     }
 
     this.ws.onopen = () => {
+      const attempts = this.reconnectAttempts;
       this.reconnectAttempts = 0;
-      this.setStatus("connected");
+      this.setStatus("connected", { attempts });
     };
 
     this.ws.onmessage = (event) => {
@@ -79,7 +87,7 @@ export class BinanceAggTradeStream {
     };
 
     this.ws.onerror = () => {
-      this.setStatus("reconnecting");
+      this.setStatus("reconnecting", { attempts: this.reconnectAttempts });
       this.ws?.close();
     };
 
@@ -87,7 +95,7 @@ export class BinanceAggTradeStream {
       if (this.shouldReconnect) {
         this.scheduleReconnect();
       } else {
-        this.setStatus("disconnected");
+        this.setStatus("disconnected", { attempts: this.reconnectAttempts });
       }
     };
   }
@@ -96,7 +104,7 @@ export class BinanceAggTradeStream {
     this.reconnectAttempts += 1;
     const delay = Math.min(MAX_BACKOFF, 1000 * 2 ** (this.reconnectAttempts - 1));
     this.clearTimer();
-    this.setStatus("reconnecting");
+    this.setStatus("reconnecting", { attempts: this.reconnectAttempts, nextRetryMs: delay });
     this.reconnectTimer = window.setTimeout(() => this.openConnection(), delay);
   }
 
@@ -107,42 +115,201 @@ export class BinanceAggTradeStream {
     }
   }
 
-  private setStatus(status: ConnectionStatus) {
-    if (this.currentStatus === status) {
+  private setStatus(status: ConnectionStatus, meta?: StreamStatusMeta) {
+    const unchanged = this.currentStatus === status;
+    this.currentStatus = status;
+
+    if (unchanged && !meta) {
       return;
     }
-    this.currentStatus = status;
-    this.handlers.onStatusChange?.(status);
+
+    const payload: StreamStatusMeta | undefined = meta
+      ? { ...meta }
+      : { attempts: this.reconnectAttempts };
+
+    if (payload && payload.attempts === undefined) {
+      payload.attempts = this.reconnectAttempts;
+    }
+
+    this.handlers.onStatusChange?.(status, payload);
   }
+}
+
+interface AggTradeResponse {
+  a?: number | string;
+  A?: number | string;
+  t?: number | string;
+  p?: string | number;
+  q?: string | number;
+  T?: number | string;
+  E?: number | string;
+  m?: boolean;
+}
+
+interface ExchangeInfoFilter {
+  filterType: string;
+  tickSize?: string;
+  stepSize?: string;
+  minPrice?: string;
+  maxPrice?: string;
+}
+
+interface ExchangeInfoSymbol {
+  symbol: string;
+  filters: ExchangeInfoFilter[];
+}
+
+interface ExchangeInfoResponse {
+  symbols?: ExchangeInfoSymbol[];
+}
+
+export interface FetchAggTradesParams {
+  symbol: string;
+  startTime?: number;
+  endTime?: number;
+  fromId?: number;
+  limit?: number;
+}
+
+export async function fetchServerTime(): Promise<number> {
+  ensureFetch();
+  const response = await fetch(`${REST_BASE}/time`);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Binance server time: ${response.status}`);
+  }
+  const payload = await response.json();
+  const serverTime = safeNumber(payload?.serverTime);
+  if (serverTime === null) {
+    throw new Error("Invalid server time response from Binance");
+  }
+  return serverTime;
+}
+
+export async function fetchAggTrades(params: FetchAggTradesParams): Promise<Trade[]> {
+  ensureFetch();
+  const { symbol, startTime, endTime, fromId, limit = MAX_AGG_TRADE_LIMIT } = params;
+  const url = new URL(`${REST_BASE}/aggTrades`);
+  url.searchParams.set("symbol", symbol.toUpperCase());
+
+  if (typeof fromId === "number" && Number.isFinite(fromId)) {
+    url.searchParams.set("fromId", String(Math.max(0, Math.floor(fromId))));
+  }
+  if (typeof startTime === "number" && Number.isFinite(startTime)) {
+    url.searchParams.set("startTime", String(Math.max(0, Math.floor(startTime))));
+  }
+  if (typeof endTime === "number" && Number.isFinite(endTime)) {
+    url.searchParams.set("endTime", String(Math.max(0, Math.floor(endTime))));
+  }
+
+  const cappedLimit = Math.min(Math.max(Math.floor(limit), 1), MAX_AGG_TRADE_LIMIT);
+  url.searchParams.set("limit", String(cappedLimit));
+
+  const response = await fetch(url.toString());
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Binance aggTrades: ${response.status}`);
+  }
+
+  const payload = (await response.json()) as AggTradeResponse[];
+  if (!Array.isArray(payload)) {
+    return [];
+  }
+
+  const trades: Trade[] = [];
+
+  for (const item of payload) {
+    const trade = mapAggTrade(item);
+    if (trade) {
+      trades.push(trade);
+    }
+  }
+
+  trades.sort((a, b) => (a.timestamp - b.timestamp) || (a.tradeId - b.tradeId));
+  return trades;
+}
+
+export async function fetchSymbolMarketConfig(symbol: string): Promise<SymbolMarketConfig | null> {
+  ensureFetch();
+  const url = new URL(`${REST_BASE}/exchangeInfo`);
+  url.searchParams.set("symbol", symbol.toUpperCase());
+  const response = await fetch(url.toString());
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Binance exchangeInfo: ${response.status}`);
+  }
+
+  const payload = (await response.json()) as ExchangeInfoResponse;
+  const info = payload.symbols?.find((item) => item.symbol === symbol.toUpperCase());
+  if (!info) {
+    return null;
+  }
+
+  const priceFilter = info.filters?.find((filter) => filter.filterType === "PRICE_FILTER");
+  const lotSizeFilter = info.filters?.find((filter) => filter.filterType === "LOT_SIZE");
+
+  const tickSize = sanitizeStep(safeNumber(priceFilter?.tickSize), 0.1);
+  const stepSize = sanitizeStep(safeNumber(lotSizeFilter?.stepSize), tickSize);
+  const minPriceStep = sanitizeStep(safeNumber(priceFilter?.minPrice), tickSize);
+  const computedMax = safeNumber(priceFilter?.maxPrice);
+  const maxCandidate =
+    computedMax !== null && computedMax > 0 ? Math.min(computedMax, tickSize * 40) : tickSize * 40;
+  const maxPriceStep = sanitizeStep(maxCandidate, tickSize * 40, tickSize);
+
+  return {
+    tickSize,
+    stepSize,
+    minPriceStep,
+    maxPriceStep,
+  };
 }
 
 function parseAggTrade(message: string): Trade | null {
   try {
     const parsed = JSON.parse(message);
-    const data = parsed?.data;
-    if (!data) {
-      return null;
-    }
-
-    const price = Number(data.p);
-    const quantity = Number(data.q);
-    const timestamp = Number(data.T ?? data.E);
-    const tradeId = Number(data.a ?? data.A ?? data.t);
-    const isBuyerMaker = Boolean(data.m);
-
-    if (!Number.isFinite(price) || !Number.isFinite(quantity) || !Number.isFinite(timestamp)) {
-      return null;
-    }
-
-    return {
-      tradeId: Number.isFinite(tradeId) ? tradeId : Date.now(),
-      price,
-      quantity,
-      timestamp,
-      isBuyerMaker,
-    };
+    const data: AggTradeResponse | undefined = parsed?.data;
+    return data ? mapAggTrade(data) : null;
   } catch (error) {
     console.error("Failed to parse aggTrade", error);
     return null;
+  }
+}
+
+function mapAggTrade(data: AggTradeResponse): Trade | null {
+  const price = safeNumber(data.p);
+  const quantity = safeNumber(data.q);
+  const timestamp = safeNumber(data.T ?? data.E);
+  const tradeIdValue = safeNumber(data.a ?? data.A ?? data.t);
+  const isBuyerMaker = Boolean(data.m);
+
+  if (price === null || quantity === null || timestamp === null) {
+    return null;
+  }
+
+  const tradeId = tradeIdValue !== null ? Math.trunc(tradeIdValue) : Math.trunc(timestamp);
+
+  return {
+    tradeId,
+    price,
+    quantity,
+    timestamp,
+    isBuyerMaker,
+  };
+}
+
+function safeNumber(value: unknown): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function sanitizeStep(value: number | null, fallback: number, minimum?: number): number {
+  const base = value !== null && value > 0 ? value : fallback;
+  const min = minimum && minimum > 0 ? minimum : fallback;
+  return Number(Math.max(min, base).toFixed(10));
+}
+
+function ensureFetch(): void {
+  if (typeof fetch === "undefined") {
+    throw new Error("Global fetch is not available in the current environment");
   }
 }

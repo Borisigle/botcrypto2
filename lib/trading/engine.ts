@@ -292,6 +292,8 @@ export class TradingEngine {
 
   private timeframeMs: number;
 
+  private clockOffsetMs = 0;
+
   private settings: TradingSettings;
 
   private signals = new Map<string, FootprintSignal>();
@@ -340,7 +342,7 @@ export class TradingEngine {
     }
 
     const riskFraction = this.settings.riskPerTradePercent / 100;
-    const day = getDayKey(Date.now());
+    const day = this.getCurrentDayKey();
     const trades = this.history.filter((trade) => trade.day === day);
     this.daily = createDailyPerformance(day, trades, riskFraction);
   }
@@ -366,6 +368,20 @@ export class TradingEngine {
     if (typeof context.timeframeMs === "number" && context.timeframeMs > 0 && context.timeframeMs !== this.timeframeMs) {
       this.timeframeMs = context.timeframeMs;
     }
+  }
+
+  updateClockOffset(offsetMs: number): boolean {
+    if (!Number.isFinite(offsetMs)) {
+      return false;
+    }
+    const normalized = Math.round(offsetMs);
+    if (normalized === this.clockOffsetMs) {
+      return false;
+    }
+    this.clockOffsetMs = normalized;
+    this.updateDailyPerformance();
+    this.bumpVersion();
+    return true;
   }
 
   updateSettings(partial: Partial<TradingSettings>): boolean {
@@ -464,7 +480,7 @@ export class TradingEngine {
         signals: newSignals,
       });
     } else if (barsChanged) {
-      const latestTime = this.lastBars.length ? this.lastBars[this.lastBars.length - 1].endTime : Date.now();
+      const latestTime = this.lastBars.length ? this.lastBars[this.lastBars.length - 1].endTime : this.now();
       evaluationChanged = this.evaluateInvalidations({ now: latestTime, reason: "bars" });
     }
 
@@ -508,7 +524,7 @@ export class TradingEngine {
       return false;
     }
     const exitPrice = typeof price === "number" ? price : this.lastPrice ?? this.positions[index].lastPrice;
-    this.closePosition(index, exitPrice, this.lastTimestamp || Date.now(), reason);
+    this.closePosition(index, exitPrice, this.lastTimestamp || this.now(), reason);
     this.bumpVersion();
     return true;
   }
@@ -651,7 +667,7 @@ export class TradingEngine {
   }
 
   resetDay(day?: string): void {
-    const targetDay = day ?? getDayKey(Date.now());
+    const targetDay = day ?? this.getCurrentDayKey();
     this.history = this.history.filter((trade) => trade.day !== targetDay);
     this.closed = this.closed.filter((trade) => trade.day !== targetDay);
     this.updateDailyPerformance();
@@ -1856,7 +1872,7 @@ export class TradingEngine {
     position.lastPrice = price;
 
     if (position.remainingSize <= PRICE_EPSILON) {
-      this.closePosition(index, price, this.lastTimestamp || Date.now(), "invalidation");
+      this.closePosition(index, price, this.lastTimestamp || this.now(), "invalidation");
       return true;
     }
 
@@ -1893,8 +1909,16 @@ export class TradingEngine {
     return entry + 2 * risk * direction;
   }
 
+  private now(): number {
+    return Date.now() + this.clockOffsetMs;
+  }
+
+  private getCurrentDayKey(): string {
+    return getDayKey(this.now());
+  }
+
   private updateDailyPerformance() {
-    const day = getDayKey(Date.now());
+    const day = this.getCurrentDayKey();
     const trades = this.history.filter((trade) => trade.day === day);
     const riskFraction = this.settings.riskPerTradePercent / 100;
     this.daily = createDailyPerformance(day, trades, riskFraction);

@@ -8,6 +8,22 @@ export interface Settings {
   showCumulativeDelta: boolean;
 }
 
+export interface SymbolMarketConfig {
+  tickSize: number;
+  stepSize: number;
+  minPriceStep: number;
+  maxPriceStep: number;
+}
+
+export interface ConnectionDiagnostics {
+  reconnectAttempts: number;
+  serverTimeOffsetMs: number;
+  lastGapFillAt: number | null;
+  gapFrom: number | null;
+  gapTo: number | null;
+  gapTradeCount: number;
+}
+
 export interface Trade {
   tradeId: number;
   price: number;
