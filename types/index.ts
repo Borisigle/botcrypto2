@@ -116,3 +116,121 @@ export interface SignalControlState {
   enabledStrategies: Record<SignalStrategy, boolean>;
   overrides: DetectorOverrides;
 }
+
+export interface TradingSettings {
+  autoTake: boolean;
+  riskPerTradePercent: number;
+  feesPercent: number;
+  slippageTicks: number;
+  partialTakePercent: number;
+  timeStopMinutes: number | null;
+  retestWindowMinutes: number;
+  beOffsetTicks: number;
+  invalidationBars: number;
+}
+
+export type TradeExitReason = "tp2" | "stop" | "breakeven" | "time-stop" | "invalidation" | "cancelled";
+
+export type TradeFirstHit = "tp1" | "tp2" | "stop" | "time-stop" | "invalidation" | "none";
+
+export type TradeResult = "win" | "loss" | "breakeven";
+
+export interface PendingTrade {
+  id: string;
+  signalId: string;
+  side: SignalSide;
+  strategy: SignalStrategy;
+  session: TradingSession;
+  entry: number;
+  stop: number;
+  target1: number;
+  target2: number;
+  createdAt: number;
+  expiresAt: number;
+  entryType: "touch";
+  auto: boolean;
+  barIndex: number;
+}
+
+export interface Position {
+  id: string;
+  signalId: string;
+  side: SignalSide;
+  strategy: SignalStrategy;
+  session: TradingSession;
+  entryPrice: number;
+  entryFillPrice: number;
+  originalStop: number;
+  stopPrice: number;
+  target1: number;
+  target2: number;
+  entryTime: number;
+  entryBarIndex: number;
+  size: number;
+  remainingSize: number;
+  partialSize: number;
+  riskAmount: number;
+  riskPerUnit: number;
+  timeStopAt: number | null;
+  target1Hit: boolean;
+  firstHit: TradeFirstHit;
+  realizedPnl: number;
+  realizedR: number;
+  feesPaid: number;
+  mfe: number;
+  mae: number;
+  lastPrice: number;
+}
+
+export interface ClosedTrade {
+  id: string;
+  signalId: string;
+  side: SignalSide;
+  strategy: SignalStrategy;
+  session: TradingSession;
+  entryPrice: number;
+  entryFillPrice: number;
+  exitPrice: number;
+  entryTime: number;
+  exitTime: number;
+  holdMinutes: number;
+  firstHit: TradeFirstHit;
+  exitReason: TradeExitReason;
+  result: TradeResult;
+  realizedPnl: number;
+  realizedR: number;
+  feesPaid: number;
+  mfe: number;
+  mae: number;
+  day: string;
+}
+
+export interface SummaryStats {
+  trades: number;
+  winners: number;
+  losers: number;
+  breakeven: number;
+  netR: number;
+  netPercent: number;
+  avgR: number;
+  expectancy: number;
+  winRate: number;
+  lossRate: number;
+}
+
+export interface DailyPerformance {
+  day: string;
+  totals: SummaryStats;
+  bySession: Record<TradingSession, SummaryStats>;
+  byStrategy: Record<SignalStrategy, SummaryStats>;
+}
+
+export interface TradingState {
+  settings: TradingSettings;
+  pending: PendingTrade[];
+  positions: Position[];
+  closed: ClosedTrade[];
+  history: ClosedTrade[];
+  daily: DailyPerformance;
+  version: number;
+}
