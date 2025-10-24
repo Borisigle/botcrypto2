@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
 import { Controls } from "@/components/Controls";
@@ -8,17 +8,30 @@ import { CumDeltaChart } from "@/components/CumDeltaChart";
 import { FootprintChart } from "@/components/FootprintChart";
 import { StatusBar } from "@/components/StatusBar";
 import { useFootprint } from "@/hooks/useFootprint";
-import type { HoverInfo } from "@/types";
+import { MODE_PRESETS } from "@/lib/signals";
+import type { FootprintSignal, HoverInfo, SignalStrategy } from "@/types";
 import { formatTimestamp } from "@/utils/color";
+
+const STRATEGY_LABELS: Record<SignalStrategy, string> = {
+  "absorption-failure": "Absorción + fallo",
+  "poc-migration": "Migración de POC",
+  "delta-divergence": "Divergencia delta",
+};
 
 export default function Page() {
   const {
     bars,
+    signals,
+    signalStats,
+    signalControl,
     settings,
     updateSettings,
     setTimeframe,
     setPriceStep,
     toggleCumulativeDelta,
+    setSignalMode,
+    toggleStrategy: toggleSignalStrategy,
+    updateSignalOverrides,
     connectionStatus,
     priceBounds,
     lastError,

@@ -2,12 +2,13 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { FootprintBar, HoverInfo } from "@/types";
+import type { FootprintBar, FootprintSignal, HoverInfo } from "@/types";
 import { deltaToRgba } from "@/utils/color";
 import { precisionFromStep } from "@/lib/aggregator";
 
 interface FootprintChartProps {
   bars: FootprintBar[];
+  signals: FootprintSignal[];
   priceStep: number;
   priceBounds: { min: number; max: number; maxVolume: number } | null;
   onHover: (hover: HoverInfo | null, position?: { x: number; y: number }) => void;
@@ -17,12 +18,22 @@ const BACKGROUND = "#020617"; // slate-950
 const GRID_COLOR = "rgba(148, 163, 184, 0.06)";
 const POC_STROKE = "rgba(254, 240, 138, 0.9)";
 
-export function FootprintChart({ bars, priceStep, priceBounds, onHover }: FootprintChartProps) {
+export function FootprintChart({ bars, signals, priceStep, priceBounds, onHover }: FootprintChartProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const signalPositionsRef = useRef<
+    Array<{ id: string; x: number; y: number; radius: number; signal: FootprintSignal }>
+  >([]);
   const [size, setSize] = useState({ width: 0, height: 0 });
 
   const precision = useMemo(() => precisionFromStep(priceStep), [priceStep]);
+  const barIndexByTime = useMemo(() => {
+    const map = new Map<number, number>();
+    for (let i = 0; i < bars.length; i += 1) {
+      map.set(bars[i].startTime, i);
+    }
+    return map;
+  }, [bars]);
 
   useEffect(() => {
     if (!containerRef.current) {
@@ -53,6 +64,8 @@ export function FootprintChart({ bars, priceStep, priceBounds, onHover }: Footpr
     if (!context) {
       return;
     }
+
+    signalPositionsRef.current = [];
 
     const dpr = window.devicePixelRatio ?? 1;
     canvas.width = size.width * dpr;
@@ -129,7 +142,49 @@ export function FootprintChart({ bars, priceStep, priceBounds, onHover }: Footpr
         context.strokeRect(x + 0.5, y + 0.5, Math.max(1, cellWidth - 1), Math.max(1, cellHeight - 1));
       }
     }
-  }, [bars, priceBounds, priceStep, precision, size.height, size.width]);
+
+    if (signals.length) {
+      for (const signal of signals) {
+        const barIndex = barIndexByTime.get(signal.barTime) ?? signal.barIndex ?? -1;
+        if (barIndex < 0 || barIndex >= bars.length) {
+          continue;
+        }
+
+        const levelPosition = (signal.entry - min) / priceStep;
+        if (!Number.isFinite(levelPosition) || levelPosition < 0 || levelPosition > levelCount - 1) {
+          continue;
+        }
+
+        const x = barIndex * cellWidth + cellWidth / 2;
+        const y = size.height - (levelPosition + 0.5) * cellHeight;
+        const radius = Math.max(4, Math.min(cellWidth, cellHeight) * 0.35);
+        const color = signal.side === "long" ? "rgba(16, 185, 129, 0.95)" : "rgba(248, 113, 113, 0.95)";
+
+        context.beginPath();
+        context.arc(x, y, radius, 0, Math.PI * 2);
+        context.fillStyle = color;
+        context.fill();
+        context.strokeStyle = "rgba(15, 23, 42, 0.95)";
+        context.lineWidth = 1.2;
+        context.stroke();
+
+        const tailLength = Math.max(6, cellHeight * 0.6);
+        context.beginPath();
+        if (signal.side === "long") {
+          context.moveTo(x, y + radius);
+          context.lineTo(x, y + radius + tailLength);
+        } else {
+          context.moveTo(x, y - radius);
+          context.lineTo(x, y - radius - tailLength);
+        }
+        context.strokeStyle = color;
+        context.lineWidth = 1.2;
+        context.stroke();
+
+        signalPositionsRef.current.push({ id: signal.id, x, y, radius: radius + 4, signal });
+      }
+    }
+  }, [barIndexByTime, bars, priceBounds, priceStep, precision, signals, size.height, size.width]);
 
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
     if (!priceBounds || !bars.length) {
@@ -148,9 +203,45 @@ export function FootprintChart({ bars, priceStep, priceBounds, onHover }: Footpr
       return;
     }
 
+    const pointerX = size.width > 0 ? (relativeX / rect.width) * size.width : relativeX;
+    const pointerY = size.height > 0 ? (relativeY / rect.height) * size.height : relativeY;
+
     const barWidth = rect.width / bars.length;
-    const barIndex = Math.min(bars.length - 1, Math.max(0, Math.floor(relativeX / barWidth)));
     const cellHeight = rect.height / levelCount;
+    const detectionThreshold = Math.max(6, Math.min(barWidth, cellHeight) * 0.5);
+
+    let matchedSignal: { id: string; x: number; y: number; radius: number; signal: FootprintSignal } | null = null;
+    let minDistance = Number.POSITIVE_INFINITY;
+    for (const position of signalPositionsRef.current) {
+      const dx = pointerX - position.x;
+      const dy = pointerY - position.y;
+      const distance = Math.hypot(dx, dy);
+      if (distance <= position.radius + detectionThreshold && distance < minDistance) {
+        matchedSignal = position;
+        minDistance = distance;
+      }
+    }
+
+    if (matchedSignal) {
+      const signal = matchedSignal.signal;
+      const barIndex = barIndexByTime.get(signal.barTime) ?? signal.barIndex ?? 0;
+      const levelIndex = Math.round((signal.entry - min) / priceStep);
+      const hover: HoverInfo = {
+        barIndex: Math.max(0, Math.min(bars.length - 1, barIndex)),
+        levelIndex,
+        price: signal.entry,
+        time: signal.barTime,
+        askVol: 0,
+        bidVol: 0,
+        delta: signal.score,
+        totalVolume: 0,
+        signalId: signal.id,
+      };
+      onHover(hover, { x: event.clientX, y: event.clientY });
+      return;
+    }
+
+    const barIndex = Math.min(bars.length - 1, Math.max(0, Math.floor(relativeX / barWidth)));
     const invertedIndex = levelCount - 1 - Math.floor(relativeY / cellHeight);
 
     if (invertedIndex < 0 || invertedIndex >= levelCount) {

@@ -2,7 +2,8 @@
 
 import { FootprintAggregator, timeframeToMs } from "@/lib/aggregator";
 import type { AggregatorSettings } from "@/lib/aggregator";
-import type { FootprintState, Trade } from "@/types";
+import { createDefaultSignalControlState } from "@/lib/signals";
+import type { FootprintState, SignalControlState, Trade } from "@/types";
 
 interface InitMessage {
   type: "init";
@@ -20,11 +21,16 @@ interface SettingsMessage {
   reset?: boolean;
 }
 
+interface DetectorConfigMessage {
+  type: "detector-config";
+  config: Partial<SignalControlState>;
+}
+
 interface ClearMessage {
   type: "clear";
 }
 
-type WorkerMessage = InitMessage | TradesMessage | SettingsMessage | ClearMessage;
+type WorkerMessage = InitMessage | TradesMessage | SettingsMessage | DetectorConfigMessage | ClearMessage;
 
 type WorkerSettings = {
   timeframe: string;
@@ -34,6 +40,7 @@ type WorkerSettings = {
 
 let aggregator: FootprintAggregator | null = null;
 let currentSettings: WorkerSettings | null = null;
+let detectorConfig: SignalControlState = createDefaultSignalControlState();
 
 const ctx: DedicatedWorkerGlobalScope = self as unknown as DedicatedWorkerGlobalScope;
 
@@ -44,7 +51,7 @@ ctx.onmessage = (event: MessageEvent<WorkerMessage>) => {
     switch (message.type) {
       case "init":
         currentSettings = message.settings;
-        aggregator = createAggregator(currentSettings);
+        aggregator = createAggregator(currentSettings, detectorConfig);
         sendState(aggregator.getState());
         break;
       case "trades":
@@ -52,7 +59,7 @@ ctx.onmessage = (event: MessageEvent<WorkerMessage>) => {
           if (!currentSettings) {
             return;
           }
-          aggregator = createAggregator(currentSettings);
+          aggregator = createAggregator(currentSettings, detectorConfig);
         }
         if (!message.trades.length) {
           return;
@@ -67,7 +74,7 @@ ctx.onmessage = (event: MessageEvent<WorkerMessage>) => {
         };
 
         if (!aggregator) {
-          aggregator = createAggregator(currentSettings);
+          aggregator = createAggregator(currentSettings, detectorConfig);
           sendState(aggregator.getState());
           break;
         }
@@ -86,9 +93,18 @@ ctx.onmessage = (event: MessageEvent<WorkerMessage>) => {
         aggregator.updateSettings(partial, { reset: message.reset });
         sendState(aggregator.getState());
         break;
+      case "detector-config":
+        detectorConfig = mergeSignalConfig(detectorConfig, message.config);
+        if (aggregator) {
+          aggregator.updateSignalConfig(detectorConfig);
+          sendState(aggregator.getState());
+        } else {
+          sendState(emptyState());
+        }
+        break;
       case "clear":
         aggregator?.reset();
-        sendState(aggregator?.getState() ?? { bars: [] });
+        sendState(aggregator ? aggregator.getState() : emptyState());
         break;
       default:
         break;
@@ -99,15 +115,52 @@ ctx.onmessage = (event: MessageEvent<WorkerMessage>) => {
   }
 };
 
-function createAggregator(settings: WorkerSettings) {
+function createAggregator(settings: WorkerSettings, config: SignalControlState) {
   const timeframeMs = timeframeToMs(settings.timeframe);
-  return new FootprintAggregator({
+  const instance = new FootprintAggregator({
     timeframeMs,
     priceStep: settings.priceStep,
     maxBars: settings.maxBars,
   });
+  instance.updateSignalConfig(config);
+  return instance;
 }
 
 function sendState(state: FootprintState) {
   ctx.postMessage({ type: "state", state });
+}
+
+function mergeSignalConfig(
+  base: SignalControlState,
+  partial: Partial<SignalControlState>,
+): SignalControlState {
+  return {
+    mode: partial.mode ?? base.mode,
+    enabledStrategies: {
+      ...base.enabledStrategies,
+      ...(partial.enabledStrategies ?? {}),
+    },
+    overrides: {
+      ...base.overrides,
+      ...(partial.overrides ?? {}),
+    },
+  };
+}
+
+function emptyState(): FootprintState {
+  return {
+    bars: [],
+    signals: [],
+    signalStats: {
+      dailyCount: 0,
+      estimatePerDay: 0,
+      lastReset: 0,
+      sessionCount: {
+        asia: 0,
+        eu: 0,
+        us: 0,
+        other: 0,
+      },
+    },
+  };
 }
