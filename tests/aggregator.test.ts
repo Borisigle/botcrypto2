@@ -102,4 +102,24 @@ describe("FootprintAggregator", () => {
     expect(state.bars[0].totalDelta).toBeCloseTo(-1);
     expect(state.bars[1].totalDelta).toBeCloseTo(3);
   });
+
+  it("ignores duplicate trades by tradeId", () => {
+    const aggregator = new FootprintAggregator({
+      timeframeMs: timeframeToMs("1m"),
+      priceStep: 1,
+      maxBars: 10,
+    });
+
+    const first: Trade = { tradeId: 11, price: 42_000, quantity: 1, timestamp: 1_000, isBuyerMaker: false };
+    const duplicate: Trade = { ...first, timestamp: 1_200 };
+    const second: Trade = { tradeId: 12, price: 42_000, quantity: 2, timestamp: 1_400, isBuyerMaker: true };
+
+    aggregator.ingestTrades([first]);
+    const state = aggregator.ingestTrades([duplicate, second]);
+
+    expect(state.bars).toHaveLength(1);
+    const [bar] = state.bars;
+    expect(bar.totalVolume).toBeCloseTo(3);
+    expect(bar.totalDelta).toBeCloseTo(-1);
+  });
 });

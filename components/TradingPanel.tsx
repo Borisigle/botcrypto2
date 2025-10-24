@@ -6,16 +6,25 @@ import type { FootprintSignal, InvalidationActionType, PendingTrade, Position, T
 interface TradingPanelProps {
   signals: FootprintSignal[];
   tradingState: TradingState;
+  clockOffsetMs: number;
   onTakeSignal: (signalId: string) => void;
   onCancelPending: (id: string) => void;
   onFlattenPosition: (id: string) => void;
   onInvalidationAction: (eventId: string, action: InvalidationActionType) => void;
 }
 
-export function TradingPanel({ signals, tradingState, onTakeSignal, onCancelPending, onFlattenPosition, onInvalidationAction }: TradingPanelProps) {
+export function TradingPanel({
+  signals,
+  tradingState,
+  clockOffsetMs,
+  onTakeSignal,
+  onCancelPending,
+  onFlattenPosition,
+  onInvalidationAction,
+}: TradingPanelProps) {
   const { pending, positions, closed, settings, daily } = tradingState;
   const retestWindowMs = Math.max(0, settings.retestWindowMinutes) * 60_000;
-  const now = Date.now();
+  const now = Date.now() + clockOffsetMs;
 
   const activeSignalIds = useMemo(() => {
     const ids = new Set<string>();

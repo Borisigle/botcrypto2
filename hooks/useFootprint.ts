@@ -3,10 +3,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { timeframeToMs } from "@/lib/aggregator";
-import { BinanceAggTradeStream } from "@/lib/binance";
+import {
+  BinanceAggTradeStream,
+  fetchAggTrades,
+  fetchServerTime,
+  fetchSymbolMarketConfig,
+  type StreamStatusMeta,
+} from "@/lib/binance";
 import { TradingEngine, DEFAULT_TRADING_SETTINGS } from "@/lib/trading/engine";
 import { createDefaultSignalControlState } from "@/lib/signals";
 import type {
+  ConnectionDiagnostics,
   ConnectionStatus,
   DetectorOverrides,
   FootprintBar,
@@ -18,6 +25,7 @@ import type {
   SignalMode,
   SignalStats,
   SignalStrategy,
+  SymbolMarketConfig,
   Timeframe,
   Trade,
   TradingSettings,
@@ -36,6 +44,26 @@ const FLUSH_INTERVAL = 200;
 const SIGNAL_CONFIG_STORAGE_KEY = "footprint.signalConfig";
 const TRADING_SETTINGS_STORAGE_KEY = "footprint.trading.settings";
 const TRADING_HISTORY_STORAGE_KEY = "footprint.trading.history";
+const BACKFILL_LOOKBACK_MINUTES = 3;
+const BACKFILL_LOOKBACK_MS = BACKFILL_LOOKBACK_MINUTES * 60_000;
+const SERVER_TIME_SYNC_INTERVAL = 60_000;
+const MAX_TRACKED_TRADE_IDS = 50_000;
+
+const INITIAL_MARKET_CONFIG: SymbolMarketConfig = {
+  tickSize: 0.1,
+  stepSize: 0.001,
+  minPriceStep: 0.1,
+  maxPriceStep: 2,
+};
+
+const INITIAL_DIAGNOSTICS: ConnectionDiagnostics = {
+  reconnectAttempts: 0,
+  serverTimeOffsetMs: 0,
+  lastGapFillAt: null,
+  gapFrom: null,
+  gapTo: null,
+  gapTradeCount: 0,
+};
 
 const DEFAULT_TRADING_STATE: TradingState = (() => {
   const engine = new TradingEngine({
@@ -74,7 +102,52 @@ interface WorkerErrorMessage {
   message: string;
 }
 
-type WorkerMessage = WorkerStateMessage | WorkerErrorMessage;
+interface TradeIdCache {
+  set: Set<number>;
+  queue: number[];
+  start: number;
+}
+
+function createTradeIdCache(): TradeIdCache {
+  return {
+    set: new Set<number>(),
+    queue: [],
+    start: 0,
+  };
+}
+
+function registerTradeId(cache: TradeIdCache, rawTradeId: number): boolean {
+  if (!Number.isFinite(rawTradeId)) {
+    return true;
+  }
+  const tradeId = Math.trunc(rawTradeId);
+  if (cache.set.has(tradeId)) {
+    return false;
+  }
+  cache.set.add(tradeId);
+  cache.queue.push(tradeId);
+
+  while (cache.queue.length - cache.start > MAX_TRACKED_TRADE_IDS) {
+    const id = cache.queue[cache.start];
+    if (typeof id === "number") {
+      cache.set.delete(id);
+    }
+    cache.start += 1;
+  }
+
+  if (cache.start > 0 && cache.start * 2 > cache.queue.length) {
+    cache.queue = cache.queue.slice(cache.start);
+    cache.start = 0;
+  }
+
+  return true;
+}
+
+function resetTradeIdCache(cache: TradeIdCache) {
+  cache.set.clear();
+  cache.queue = [];
+  cache.start = 0;
+}
 
 function mergeSignalControl(
   base: SignalControlState,
@@ -114,6 +187,19 @@ function normalizeSignalStats(stats?: SignalStats): SignalStats {
   };
 }
 
+function normalizePriceStep(step: number, config: SymbolMarketConfig): number {
+  const tick = config.tickSize > 0 ? config.tickSize : 0.1;
+  const min = config.minPriceStep > 0 ? config.minPriceStep : tick;
+  const maxBase = config.maxPriceStep > min ? config.maxPriceStep : Math.max(min, tick * 40);
+  if (!Number.isFinite(step) || step <= 0) {
+    return Number(min.toFixed(8));
+  }
+  const multiplier = Math.max(1, Math.round(step / tick));
+  const normalized = multiplier * tick;
+  const clamped = Math.min(Math.max(normalized, min), maxBase);
+  return Number(clamped.toFixed(8));
+}
+
 export function useFootprint() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [bars, setBars] = useState<FootprintBar[]>([]);
@@ -125,13 +211,50 @@ export function useFootprint() {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
   const [lastError, setLastError] = useState<string | null>(null);
   const [tradingState, setTradingState] = useState<TradingState>(DEFAULT_TRADING_STATE);
+  const [connectionDiagnostics, setConnectionDiagnostics] = useState<ConnectionDiagnostics>(
+    INITIAL_DIAGNOSTICS,
+  );
+  const [serverTimeOffsetMs, setServerTimeOffsetMs] = useState(0);
+  const [marketConfig, setMarketConfig] = useState<SymbolMarketConfig>(INITIAL_MARKET_CONFIG);
 
-  const handleStatusChange = useCallback((status: ConnectionStatus) => {
-    setConnectionStatus(status);
-    if (status === "connected") {
-      setLastError(null);
+  const priceBounds = useMemo<PriceBounds | null>(() => {
+    if (!bars.length) {
+      return null;
     }
-  }, []);
+
+    let min = Number.POSITIVE_INFINITY;
+    let max = Number.NEGATIVE_INFINITY;
+    let maxVolume = 0;
+
+    for (const bar of bars) {
+      for (const level of bar.levels) {
+        if (level.price < min) {
+          min = level.price;
+        }
+        if (level.price > max) {
+          max = level.price;
+        }
+        if (level.totalVolume > maxVolume) {
+          maxVolume = level.totalVolume;
+        }
+      }
+    }
+
+    if (!Number.isFinite(min) || !Number.isFinite(max)) {
+      return null;
+    }
+
+    return { min, max, maxVolume };
+  }, [bars]);
+
+  const priceStepConfig = useMemo(
+    () => ({
+      min: marketConfig.minPriceStep,
+      max: marketConfig.maxPriceStep,
+      step: marketConfig.tickSize,
+    }),
+    [marketConfig],
+  );
 
   const signalControlRef = useRef<SignalControlState>(signalControl);
   const tradingEngineRef = useRef<TradingEngine | null>(null);
@@ -140,6 +263,233 @@ export function useFootprint() {
   const tradeBufferRef = useRef<Trade[]>([]);
   const flushTimerRef = useRef<number | null>(null);
   const streamRef = useRef<BinanceAggTradeStream | null>(null);
+  const lastTradeTimeRef = useRef<number | null>(null);
+  const tradeIdCacheRef = useRef<TradeIdCache>(createTradeIdCache());
+  const serverTimeOffsetRef = useRef(0);
+  const symbolRef = useRef(settings.symbol);
+  const backfillPromiseRef = useRef<Promise<void> | null>(null);
+  const recoveringRef = useRef(false);
+  const recoveryQueueRef = useRef<Trade[]>([]);
+  const wasEverConnectedRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const marketConfigRef = useRef<SymbolMarketConfig>(INITIAL_MARKET_CONFIG);
+
+  const syncServerTime = useCallback(async () => {
+    try {
+      const serverTime = await fetchServerTime();
+      const offset = Math.round(serverTime - Date.now());
+      serverTimeOffsetRef.current = offset;
+      setServerTimeOffsetMs(offset);
+      setConnectionDiagnostics((prev) => ({
+        ...prev,
+        serverTimeOffsetMs: offset,
+      }));
+    } catch (error) {
+      console.warn("Failed to sync server time", error);
+    }
+  }, []);
+
+  const flushTrades = useCallback(
+    (force = false) => {
+      const worker = workerRef.current;
+      if (!worker || !workerReadyRef.current) {
+        return;
+      }
+
+      const buffer = tradeBufferRef.current;
+      if (!buffer.length) {
+        return;
+      }
+
+      if (!force && buffer.length < 50 && flushTimerRef.current !== null) {
+        return;
+      }
+
+      worker.postMessage({ type: "trades", trades: buffer.splice(0) });
+      if (flushTimerRef.current !== null) {
+        window.clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = null;
+      }
+    },
+    [],
+  );
+
+  const pushTrade = useCallback(
+    (trade: Trade) => {
+      tradeBufferRef.current.push(trade);
+      const engine = tradingEngineRef.current;
+      if (engine) {
+        const updated = engine.handleTrade(trade);
+        if (updated) {
+          setTradingState(engine.getState());
+        }
+      }
+
+      if (tradeBufferRef.current.length >= 150) {
+        flushTrades(true);
+      } else if (flushTimerRef.current === null) {
+        flushTimerRef.current = window.setTimeout(() => {
+          flushTrades(true);
+        }, FLUSH_INTERVAL);
+      }
+    },
+    [flushTrades],
+  );
+
+  const drainRecoveryQueue = useCallback(() => {
+    if (!recoveryQueueRef.current.length) {
+      return;
+    }
+    const queued = recoveryQueueRef.current.splice(0);
+    for (const trade of queued) {
+      pushTrade(trade);
+    }
+    flushTrades(true);
+  }, [pushTrade, flushTrades]);
+
+  const startBackfill = useCallback(() => {
+    if (backfillPromiseRef.current) {
+      return backfillPromiseRef.current;
+    }
+    if (!workerReadyRef.current || !workerRef.current) {
+      return Promise.resolve();
+    }
+
+    recoveringRef.current = true;
+
+    const promise = (async () => {
+      const symbol = symbolRef.current;
+      const serverOffset = serverTimeOffsetRef.current;
+      const serverNow = Date.now() + serverOffset;
+      const fallbackStart = serverNow - BACKFILL_LOOKBACK_MS;
+      const lastProcessed = lastTradeTimeRef.current ?? fallbackStart;
+      const startTime = Math.max(0, Math.min(lastProcessed, serverNow) - BACKFILL_LOOKBACK_MS);
+      const endTime = Math.max(serverNow, startTime + 1);
+
+      let collected: Trade[] = [];
+      let nextStart = startTime;
+      let nextFromId: number | undefined;
+
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        const chunk = await fetchAggTrades({
+          symbol,
+          startTime: nextFromId ? undefined : nextStart,
+          endTime,
+          fromId: nextFromId,
+          limit: 1000,
+        });
+
+        if (!chunk.length) {
+          break;
+        }
+
+        collected = collected.concat(chunk);
+        const last = chunk[chunk.length - 1];
+        if (!last) {
+          break;
+        }
+
+        if (chunk.length < 1000 || last.timestamp >= endTime) {
+          break;
+        }
+
+        nextStart = last.timestamp + 1;
+        nextFromId = last.tradeId + 1;
+      }
+
+      collected.sort((a, b) => (a.timestamp - b.timestamp) || (a.tradeId - b.tradeId));
+
+      const fresh: Trade[] = [];
+      for (const trade of collected) {
+        if (registerTradeId(tradeIdCacheRef.current, trade.tradeId)) {
+          fresh.push(trade);
+          lastTradeTimeRef.current = Math.max(lastTradeTimeRef.current ?? 0, trade.timestamp);
+        }
+      }
+
+      if (fresh.length) {
+        for (const trade of fresh) {
+          pushTrade(trade);
+        }
+        flushTrades(true);
+      }
+
+      setConnectionDiagnostics((prev) => ({
+        ...prev,
+        lastGapFillAt: serverNow,
+        gapFrom: fresh.length ? fresh[0].timestamp : null,
+        gapTo: fresh.length ? fresh[fresh.length - 1].timestamp : null,
+        gapTradeCount: fresh.length,
+      }));
+    })()
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        setLastError(message);
+      })
+      .finally(() => {
+        backfillPromiseRef.current = null;
+        recoveringRef.current = false;
+        drainRecoveryQueue();
+        flushTrades(true);
+      });
+
+    backfillPromiseRef.current = promise;
+    return promise;
+  }, [drainRecoveryQueue, flushTrades, pushTrade]);
+
+  const processIncomingTrade = useCallback(
+    (trade: Trade) => {
+      lastTradeTimeRef.current = Math.max(lastTradeTimeRef.current ?? 0, trade.timestamp);
+      if (!registerTradeId(tradeIdCacheRef.current, trade.tradeId)) {
+        return;
+      }
+
+      if (recoveringRef.current && backfillPromiseRef.current) {
+        recoveryQueueRef.current.push(trade);
+        return;
+      }
+
+      pushTrade(trade);
+    },
+    [pushTrade],
+  );
+
+  const handleStatusChange = useCallback(
+    (status: ConnectionStatus, meta?: StreamStatusMeta) => {
+      setConnectionStatus(status);
+
+      if (status === "reconnecting") {
+        const attempts = meta?.attempts ?? reconnectAttemptsRef.current + 1;
+        reconnectAttemptsRef.current = attempts;
+        setConnectionDiagnostics((prev) => ({
+          ...prev,
+          reconnectAttempts: attempts,
+        }));
+      } else if (status === "connected") {
+        const attempts = meta?.attempts ?? reconnectAttemptsRef.current;
+        setLastError(null);
+        setConnectionDiagnostics((prev) => ({
+          ...prev,
+          reconnectAttempts: attempts,
+        }));
+        reconnectAttemptsRef.current = 0;
+
+        if (wasEverConnectedRef.current && attempts > 0) {
+          startBackfill();
+        }
+        wasEverConnectedRef.current = true;
+        syncServerTime();
+      } else if (status === "disconnected") {
+        reconnectAttemptsRef.current = 0;
+        wasEverConnectedRef.current = false;
+        setConnectionDiagnostics((prev) => ({
+          ...prev,
+          reconnectAttempts: 0,
+        }));
+      }
+    },
+    [startBackfill, syncServerTime],
+  );
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -151,7 +501,7 @@ export function useFootprint() {
     });
     workerRef.current = worker;
 
-    worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
+    worker.onmessage = (event: MessageEvent<WorkerStateMessage | WorkerErrorMessage>) => {
       const message = event.data;
       if (message.type === "state") {
         const nextBars = message.state.bars ?? [];
@@ -245,6 +595,7 @@ export function useFootprint() {
       settings: storedSettings,
       history: storedHistory,
     });
+    engine.updateClockOffset(serverTimeOffsetRef.current);
     tradingEngineRef.current = engine;
     setTradingState(engine.getState());
 
@@ -278,30 +629,80 @@ export function useFootprint() {
     });
   }, [settings.priceStep, settings.timeframe]);
 
-  const flushTrades = useCallback(
-    (force = false) => {
-      const worker = workerRef.current;
-      if (!worker || !workerReadyRef.current) {
-        return;
-      }
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
 
-      const buffer = tradeBufferRef.current;
-      if (!buffer.length) {
-        return;
-      }
+    syncServerTime();
+    const interval = window.setInterval(() => {
+      syncServerTime();
+    }, SERVER_TIME_SYNC_INTERVAL);
 
-      if (!force && buffer.length < 50 && flushTimerRef.current !== null) {
-        return;
-      }
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [syncServerTime]);
 
-      worker.postMessage({ type: "trades", trades: buffer.splice(0) });
-      if (flushTimerRef.current !== null) {
-        window.clearTimeout(flushTimerRef.current);
-        flushTimerRef.current = null;
+  useEffect(() => {
+    const engine = tradingEngineRef.current;
+    if (!engine) {
+      return;
+    }
+    const changed = engine.updateClockOffset(serverTimeOffsetMs);
+    if (changed) {
+      setTradingState(engine.getState());
+    }
+  }, [serverTimeOffsetMs]);
+
+  useEffect(() => {
+    let cancelled = false;
+    symbolRef.current = settings.symbol;
+
+    (async () => {
+      try {
+        const config = await fetchSymbolMarketConfig(settings.symbol);
+        if (cancelled) {
+          return;
+        }
+        if (config) {
+          marketConfigRef.current = config;
+          setMarketConfig(config);
+          setSettings((prev) => {
+            const normalized = normalizePriceStep(prev.priceStep, config);
+            if (Math.abs(normalized - prev.priceStep) < 1e-9) {
+              return prev;
+            }
+            return { ...prev, priceStep: normalized };
+          });
+        }
+      } catch (error) {
+        console.warn("Failed to load symbol market config", error);
       }
-    },
-    [],
-  );
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [settings.symbol]);
+
+  useEffect(() => {
+    resetTradeIdCache(tradeIdCacheRef.current);
+    lastTradeTimeRef.current = null;
+    recoveryQueueRef.current = [];
+    backfillPromiseRef.current = null;
+    recoveringRef.current = false;
+    wasEverConnectedRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    setConnectionDiagnostics((prev) => ({
+      ...prev,
+      reconnectAttempts: 0,
+      lastGapFillAt: null,
+      gapFrom: null,
+      gapTo: null,
+      gapTradeCount: 0,
+    }));
+  }, [settings.symbol]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -309,36 +710,24 @@ export function useFootprint() {
     }
 
     const stream = new BinanceAggTradeStream(settings.symbol, {
-      onTrade: (trade) => {
-        tradeBufferRef.current.push(trade);
-        const engine = tradingEngineRef.current;
-        if (engine) {
-          const updated = engine.handleTrade(trade);
-          if (updated) {
-            setTradingState(engine.getState());
-          }
-        }
-        if (tradeBufferRef.current.length >= 150) {
-          flushTrades(true);
-        } else if (flushTimerRef.current === null) {
-          flushTimerRef.current = window.setTimeout(() => {
-            flushTrades(true);
-          }, FLUSH_INTERVAL);
-        }
-      },
+      onTrade: processIncomingTrade,
       onStatusChange: handleStatusChange,
       onError: (message) => setLastError(message),
     });
 
     streamRef.current = stream;
+    wasEverConnectedRef.current = false;
     stream.connect();
 
     return () => {
       flushTrades(true);
       stream.disconnect();
       streamRef.current = null;
+      recoveringRef.current = false;
+      recoveryQueueRef.current = [];
+      backfillPromiseRef.current = null;
     };
-  }, [settings.symbol, flushTrades, handleStatusChange]);
+  }, [settings.symbol, processIncomingTrade, handleStatusChange, flushTrades]);
 
   useEffect(() => {
     if (!workerReadyRef.current || !workerRef.current) {
@@ -378,35 +767,26 @@ export function useFootprint() {
     };
   }, [flushTrades]);
 
-  const priceBounds = useMemo<PriceBounds | null>(() => {
-    if (!bars.length) {
-      return null;
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
     }
-
-    let min = Number.POSITIVE_INFINITY;
-    let max = Number.NEGATIVE_INFINITY;
-    let maxVolume = 0;
-
-    for (const bar of bars) {
-      for (const level of bar.levels) {
-        if (level.price < min) {
-          min = level.price;
-        }
-        if (level.price > max) {
-          max = level.price;
-        }
-        if (level.totalVolume > maxVolume) {
-          maxVolume = level.totalVolume;
-        }
-      }
+    const engine = tradingEngineRef.current;
+    if (!engine) {
+      return;
     }
-
-    if (!Number.isFinite(min) || !Number.isFinite(max)) {
-      return null;
+    const snapshot = engine.getPersistenceSnapshot();
+    try {
+      window.localStorage.setItem(TRADING_SETTINGS_STORAGE_KEY, JSON.stringify(snapshot.settings));
+    } catch (error) {
+      console.warn("Failed to persist trading settings", error);
     }
-
-    return { min, max, maxVolume };
-  }, [bars]);
+    try {
+      window.localStorage.setItem(TRADING_HISTORY_STORAGE_KEY, JSON.stringify(snapshot.history));
+    } catch (error) {
+      console.warn("Failed to persist trading history", error);
+    }
+  }, [tradingState.version]);
 
   const updateSettings = useCallback((partial: Partial<Settings>) => {
     setSettings((prev) => ({ ...prev, ...partial }));
@@ -417,8 +797,14 @@ export function useFootprint() {
   }, [updateSettings]);
 
   const setPriceStep = useCallback((priceStep: number) => {
-    updateSettings({ priceStep });
-  }, [updateSettings]);
+    setSettings((prev) => {
+      const normalized = normalizePriceStep(priceStep, marketConfigRef.current);
+      if (Math.abs(normalized - prev.priceStep) < 1e-9) {
+        return prev;
+      }
+      return { ...prev, priceStep: normalized };
+    });
+  }, []);
 
   const toggleCumulativeDelta = useCallback(() => {
     setSettings((prev) => ({
@@ -455,27 +841,6 @@ export function useFootprint() {
       },
     }));
   }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    const engine = tradingEngineRef.current;
-    if (!engine) {
-      return;
-    }
-    const snapshot = engine.getPersistenceSnapshot();
-    try {
-      window.localStorage.setItem(TRADING_SETTINGS_STORAGE_KEY, JSON.stringify(snapshot.settings));
-    } catch (error) {
-      console.warn("Failed to persist trading settings", error);
-    }
-    try {
-      window.localStorage.setItem(TRADING_HISTORY_STORAGE_KEY, JSON.stringify(snapshot.history));
-    } catch (error) {
-      console.warn("Failed to persist trading history", error);
-    }
-  }, [tradingState.version]);
 
   const updateTradingSettings = useCallback((partial: Partial<TradingSettings>) => {
     const engine = tradingEngineRef.current;
@@ -578,5 +943,8 @@ export function useFootprint() {
     applyInvalidationAction,
     resetTradingDay,
     exportTradingHistory,
+    connectionDiagnostics,
+    serverTimeOffsetMs,
+    priceStepConfig,
   };
 }

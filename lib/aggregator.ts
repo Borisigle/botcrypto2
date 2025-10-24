@@ -59,6 +59,7 @@ export function precisionFromStep(step: number): number {
 }
 
 const EPSILON = 1e-9;
+const MAX_TRACKED_TRADE_IDS = 50_000;
 
 function createInitialSignalStats(): SignalStats {
   return {
@@ -96,6 +97,12 @@ export class FootprintAggregator {
   private signalEngine: SignalEngine;
 
   private signalConfig: SignalControlState = createDefaultSignalControlState();
+
+  private seenTradeIds = new Set<number>();
+
+  private tradeIdQueue: number[] = [];
+
+  private tradeIdQueueStart = 0;
 
   constructor(settings: AggregatorSettings) {
     this.settings = { ...settings };
@@ -147,6 +154,9 @@ export class FootprintAggregator {
     this.signals = [];
     this.signalStats = createInitialSignalStats();
     this.signalEngine.reset();
+    this.seenTradeIds.clear();
+    this.tradeIdQueue = [];
+    this.tradeIdQueueStart = 0;
   }
 
   ingestTrades(trades: Trade[]): FootprintState {
@@ -239,6 +249,10 @@ export class FootprintAggregator {
   }
 
   private processTrade(trade: Trade) {
+    if (!this.registerTradeId(trade.tradeId)) {
+      return;
+    }
+
     const { timeframeMs, priceStep } = this.settings;
 
     const barStart = Math.floor(trade.timestamp / timeframeMs) * timeframeMs;
@@ -311,6 +325,35 @@ export class FootprintAggregator {
     this.bars.sort((a, b) => a.startTime - b.startTime);
 
     return bar;
+  }
+
+  private registerTradeId(tradeId: number): boolean {
+    if (!Number.isFinite(tradeId)) {
+      return true;
+    }
+    const normalized = Math.trunc(tradeId);
+    if (this.seenTradeIds.has(normalized)) {
+      return false;
+    }
+    this.seenTradeIds.add(normalized);
+    this.tradeIdQueue.push(normalized);
+    this.trimTradeIdCache();
+    return true;
+  }
+
+  private trimTradeIdCache() {
+    while (this.tradeIdQueue.length - this.tradeIdQueueStart > MAX_TRACKED_TRADE_IDS) {
+      const id = this.tradeIdQueue[this.tradeIdQueueStart];
+      if (typeof id === "number") {
+        this.seenTradeIds.delete(id);
+      }
+      this.tradeIdQueueStart += 1;
+    }
+
+    if (this.tradeIdQueueStart > 0 && this.tradeIdQueueStart * 2 > this.tradeIdQueue.length) {
+      this.tradeIdQueue = this.tradeIdQueue.slice(this.tradeIdQueueStart);
+      this.tradeIdQueueStart = 0;
+    }
   }
 
   private prune() {

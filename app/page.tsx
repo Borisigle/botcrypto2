@@ -38,6 +38,9 @@ export default function Page() {
     applyInvalidationAction,
     resetTradingDay,
     exportTradingHistory,
+    connectionDiagnostics,
+    serverTimeOffsetMs,
+    priceStepConfig,
   } = useFootprint();
 
   const [hover, setHover] = useState<HoverInfo | null>(null);
@@ -98,6 +101,7 @@ export default function Page() {
           <TradingPanel
             signals={signals}
             tradingState={tradingState}
+            clockOffsetMs={serverTimeOffsetMs}
             onTakeSignal={takeSignal}
             onCancelPending={cancelPendingTrade}
             onFlattenPosition={flattenPosition}
@@ -110,6 +114,7 @@ export default function Page() {
             symbol={settings.symbol}
             timeframe={settings.timeframe}
             priceStep={settings.priceStep}
+            priceStepConfig={priceStepConfig}
             showCumulativeDelta={settings.showCumulativeDelta}
             signalControl={signalControl}
             signalStats={signalStats}
@@ -136,6 +141,7 @@ export default function Page() {
         timeframe={settings.timeframe}
         priceStep={settings.priceStep}
         barsCount={bars.length}
+        diagnostics={connectionDiagnostics}
         lastError={lastError}
       />
     </main>

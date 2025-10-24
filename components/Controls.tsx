@@ -2,6 +2,7 @@
 
 import { useMemo } from "react";
 
+import { precisionFromStep } from "@/lib/aggregator";
 import { MODE_PRESETS } from "@/lib/signals";
 import type {
   DetectorOverrides,
@@ -16,6 +17,7 @@ interface ControlsProps {
   symbol: string;
   timeframe: Timeframe;
   priceStep: number;
+  priceStepConfig: { min: number; max: number; step: number };
   showCumulativeDelta: boolean;
   signalControl: SignalControlState;
   signalStats: SignalStats;
@@ -29,9 +31,6 @@ interface ControlsProps {
 }
 
 const TIMEFRAME_OPTIONS: Timeframe[] = ["1m", "5m"];
-const PRICE_STEP_MIN = 0.1;
-const PRICE_STEP_MAX = 2.0;
-const PRICE_STEP_INCREMENT = 0.1;
 
 const STRATEGIES: Array<{ id: SignalStrategy; label: string }> = [
   { id: "absorption-failure", label: "Absorción + fallo" },
@@ -50,6 +49,7 @@ export function Controls({
   symbol,
   timeframe,
   priceStep,
+  priceStepConfig,
   showCumulativeDelta,
   signalControl,
   signalStats,
@@ -61,7 +61,13 @@ export function Controls({
   onToggleStrategy,
   onOverridesChange,
 }: ControlsProps) {
-  const formattedStep = useMemo(() => priceStep.toFixed(2).replace(/\.00$/, ""), [priceStep]);
+  const { min: priceStepMin, max: priceStepMax, step: priceStepIncrement } = priceStepConfig;
+  const normalizedIncrement = priceStepIncrement > 0 ? priceStepIncrement : 0.1;
+  const stepPrecision = useMemo(() => precisionFromStep(normalizedIncrement), [normalizedIncrement]);
+  const formattedStep = useMemo(
+    () => priceStep.toFixed(stepPrecision).replace(/\.0+$/, ""),
+    [priceStep, stepPrecision],
+  );
   const modePreset = useMemo(() => MODE_PRESETS[signalControl.mode], [signalControl.mode]);
   const modeOptions = useMemo(() => Object.keys(MODE_PRESETS) as SignalMode[], []);
   const overrides = signalControl.overrides ?? {};
@@ -124,9 +130,9 @@ export function Controls({
         </div>
         <input
           type="range"
-          min={PRICE_STEP_MIN}
-          max={PRICE_STEP_MAX}
-          step={PRICE_STEP_INCREMENT}
+          min={priceStepMin}
+          max={priceStepMax}
+          step={normalizedIncrement}
           value={priceStep}
           onChange={(event) => onPriceStepChange(Number(event.target.value))}
           className="w-full accent-emerald-500"

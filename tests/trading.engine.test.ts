@@ -162,4 +162,42 @@ describe("TradingEngine", () => {
     expect(closed.firstHit === "tp2" || closed.firstHit === "tp1").toBe(true);
     expect(closed.realizedR).toBeGreaterThan(0);
   });
+
+  it("resolves trade exits by tick order when timestamps tie", () => {
+    const engine = new TradingEngine({ priceStep: 1, timeframeMs: 60_000 });
+    engine.updateSettings({
+      autoTake: true,
+      partialTakePercent: 0.5,
+      slippageTicks: 0,
+      feesPercent: 0,
+      beOffsetTicks: 0,
+    });
+
+    const signal = createSignal({
+      id: "tie",
+      side: "long",
+      entry: 100,
+      stop: 95,
+      target1: 105,
+      target2: 110,
+    });
+    engine.syncSignals([signal]);
+    engine.handleTrade(createTrade({ tradeId: 1, price: 100, timestamp: BASE_TIMESTAMP + 1000 }));
+
+    const simultaneous = [
+      createTrade({ tradeId: 2, price: 105, timestamp: BASE_TIMESTAMP + 2000, isBuyerMaker: false }),
+      createTrade({ tradeId: 3, price: 95, timestamp: BASE_TIMESTAMP + 2000, isBuyerMaker: true }),
+    ].sort((a, b) => (a.timestamp - b.timestamp) || (a.tradeId - b.tradeId));
+
+    for (const trade of simultaneous) {
+      engine.handleTrade(trade);
+    }
+
+    const state = engine.getState();
+    expect(state.positions).toHaveLength(0);
+    expect(state.closed).toHaveLength(1);
+    const closed = state.closed[0];
+    expect(closed.firstHit).toBe("tp1");
+    expect(closed.exitReason).toBe("breakeven");
+  });
 });
