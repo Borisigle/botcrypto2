@@ -1,6 +1,8 @@
 import type {
   ClosedTrade,
   DailyPerformance,
+  DepthBarMetrics,
+  DepthSweepEvent,
   FootprintBar,
   FootprintSignal,
   InvalidationActionOption,
@@ -11,6 +13,10 @@ import type {
   InvalidationSeverity,
   InvalidationThesis,
   InvalidationTriggerId,
+  ObjectiveInvalidationBreakdown,
+  ObjectiveInvalidationKpiBucket,
+  ObjectiveInvalidationKpis,
+  ObjectiveInvalidationSettings,
   PendingTrade,
   Position,
   SignalSide,
@@ -44,6 +50,34 @@ const DEFAULT_INVALIDATION_SETTINGS: InvalidationSettings = {
   keyLevelDeltaThreshold: 0.65,
 };
 
+const DEFAULT_OBJECTIVE_INVALIDATION_SETTINGS: ObjectiveInvalidationSettings = {
+  enabled: true,
+  persistenceSeconds: 60,
+  persistenceBars: 2,
+  gracePeriodSeconds: 90,
+  hysteresisPoints: 10,
+  printsThreshold: 55,
+  depthThreshold: 45,
+  printsWeight: 0.55,
+  depthWeight: 0.45,
+  severeThreshold: 90,
+  highThreshold: 75,
+  mediumThreshold: 60,
+  winnerProtectMfeR: 0.7,
+  winnerProtectTp1DistanceR: 0.3,
+  winnerProtectDepthThreshold: 40,
+  severeSweepLevels: 4,
+  severeSweepWindowMs: 2_000,
+  severeSweepMinTicks: 2,
+  severeSweepDeltaPercentile: 0.9,
+  timeDecayMinutes: 10,
+  timeDecayMinMfe: 0.3,
+  timeDecayContraBars: 2,
+  timeDecayDeltaThreshold: 0.4,
+  timeDecayOfiThreshold: 50,
+  autoCloseSevere: true,
+};
+
 const DEFAULT_TRADING_SETTINGS: TradingSettings = {
   autoTake: false,
   riskPerTradePercent: 1,
@@ -55,6 +89,7 @@ const DEFAULT_TRADING_SETTINGS: TradingSettings = {
   beOffsetTicks: 0.5,
   invalidationBars: 0,
   invalidations: { ...DEFAULT_INVALIDATION_SETTINGS },
+  objectiveInvalidation: { ...DEFAULT_OBJECTIVE_INVALIDATION_SETTINGS },
   guardrails: cloneGuardrailSettings(DEFAULT_GUARDRAIL_SETTINGS),
 };
 
@@ -90,6 +125,9 @@ const INVALIDATION_WEIGHTS: Record<InvalidationTriggerId, number> = {
   "key-level-recapture": 18,
   "time-decay": 12,
   "liquidity-sweep": 21,
+  "objective-prints": 18,
+  "objective-depth": 24,
+  "objective-time-decay": 16,
 };
 
 const AGGRESSIVENESS_MULTIPLIER: Record<InvalidationSettings["aggressiveness"], number> = {
@@ -143,6 +181,103 @@ function safeAverage(values: number[]): number {
   return sum / values.length;
 }
 
+function normalizeObjectiveSettings(settings: ObjectiveInvalidationSettings): ObjectiveInvalidationSettings {
+  const next = { ...settings };
+  next.persistenceSeconds = Math.max(10, Math.round(next.persistenceSeconds));
+  next.persistenceBars = Math.max(1, Math.round(next.persistenceBars));
+  next.gracePeriodSeconds = Math.max(0, Math.round(next.gracePeriodSeconds));
+  next.hysteresisPoints = Math.max(1, Math.round(next.hysteresisPoints));
+  next.printsThreshold = clamp(next.printsThreshold, 0, 100);
+  next.depthThreshold = clamp(next.depthThreshold, 0, 100);
+  const weightSum = Math.max(0.0001, next.printsWeight + next.depthWeight);
+  next.printsWeight = clamp(next.printsWeight / weightSum, 0, 1);
+  next.depthWeight = clamp(1 - next.printsWeight, 0, 1);
+  next.severeThreshold = clamp(next.severeThreshold, 0, 100);
+  next.highThreshold = clamp(Math.min(next.highThreshold, next.severeThreshold), 0, next.severeThreshold);
+  next.mediumThreshold = clamp(Math.min(next.mediumThreshold, next.highThreshold), 0, next.highThreshold);
+  next.winnerProtectMfeR = Math.max(0, next.winnerProtectMfeR);
+  next.winnerProtectTp1DistanceR = Math.max(0, next.winnerProtectTp1DistanceR);
+  next.winnerProtectDepthThreshold = Math.max(0, next.winnerProtectDepthThreshold);
+  next.severeSweepLevels = Math.max(1, Math.round(next.severeSweepLevels));
+  next.severeSweepWindowMs = Math.max(100, Math.round(next.severeSweepWindowMs));
+  next.severeSweepMinTicks = Math.max(1, Math.round(next.severeSweepMinTicks));
+  next.severeSweepDeltaPercentile = clamp(next.severeSweepDeltaPercentile, 0, 1);
+  next.timeDecayMinutes = Math.max(1, Math.round(next.timeDecayMinutes));
+  next.timeDecayMinMfe = Math.max(0, next.timeDecayMinMfe);
+  next.timeDecayContraBars = Math.max(1, Math.round(next.timeDecayContraBars));
+  next.timeDecayDeltaThreshold = Math.max(0, next.timeDecayDeltaThreshold);
+  next.timeDecayOfiThreshold = Math.max(0, next.timeDecayOfiThreshold);
+  next.autoCloseSevere = Boolean(next.autoCloseSevere);
+  return next;
+}
+
+function cloneObjectiveKpiBucket(source: ObjectiveInvalidationKpiBucket): ObjectiveInvalidationKpiBucket {
+  return {
+    events: source.events,
+    falsePositives: source.falsePositives,
+    falsePositiveRate: source.falsePositiveRate,
+    stopsAvoided: source.stopsAvoided,
+    savedR: source.savedR,
+    expectancyDelta: source.expectancyDelta,
+  };
+}
+
+function cloneObjectiveKpis(source: ObjectiveInvalidationKpis): ObjectiveInvalidationKpis {
+  return {
+    day: source.day,
+    total: cloneObjectiveKpiBucket(source.total),
+    perSession: {
+      asia: cloneObjectiveKpiBucket(source.perSession.asia),
+      eu: cloneObjectiveKpiBucket(source.perSession.eu),
+      us: cloneObjectiveKpiBucket(source.perSession.us),
+      other: cloneObjectiveKpiBucket(source.perSession.other),
+    },
+    perStrategy: {
+      "absorption-failure": cloneObjectiveKpiBucket(source.perStrategy["absorption-failure"]),
+      "poc-migration": cloneObjectiveKpiBucket(source.perStrategy["poc-migration"]),
+      "delta-divergence": cloneObjectiveKpiBucket(source.perStrategy["delta-divergence"]),
+    },
+  };
+}
+
+interface ObjectiveKpiAccumulator {
+  events: number;
+  falsePositives: number;
+  stopsAvoided: number;
+  savedR: number;
+  actualTotalR: number;
+  baselineTotalR: number;
+  tradeCount: number;
+}
+
+function createObjectiveKpiAccumulator(): ObjectiveKpiAccumulator {
+  return {
+    events: 0,
+    falsePositives: 0,
+    stopsAvoided: 0,
+    savedR: 0,
+    actualTotalR: 0,
+    baselineTotalR: 0,
+    tradeCount: 0,
+  };
+}
+
+function finalizeObjectiveBucket(acc: ObjectiveKpiAccumulator): ObjectiveInvalidationKpiBucket {
+  const falsePositiveRate = acc.events > 0 ? acc.falsePositives / acc.events : 0;
+  const expectancyDelta =
+    acc.tradeCount > 0
+      ? acc.actualTotalR / acc.tradeCount - acc.baselineTotalR / acc.tradeCount
+      : 0;
+  return {
+    events: acc.events,
+    falsePositives: acc.falsePositives,
+    falsePositiveRate,
+    stopsAvoided: acc.stopsAvoided,
+    savedR: acc.savedR,
+    expectancyDelta,
+  };
+}
+
 interface SummaryAccumulator {
   trades: number;
   winners: number;
@@ -161,6 +296,13 @@ interface PositionMeta {
   lastInvalidationAt: number;
   lastScore: number;
   lastTriggers: InvalidationTriggerId[];
+  objectiveStartAt: number | null;
+  objectiveStartBar: number | null;
+  objectiveActiveThreshold: number | null;
+  objectiveLastScore: number;
+  objectiveLastComponents: { prints: number; depth: number } | null;
+  objectiveLastReasons: string[];
+  objectiveLastEventId?: string | null;
 }
 
 interface InvalidationEvaluationContext {
@@ -183,6 +325,39 @@ interface TriggerResult {
   barTime?: number | null;
   barIndex?: number | null;
   thesis?: TriggerNarrative;
+}
+
+interface ObjectivePrintsEvaluation {
+  score: number;
+  evidence: InvalidationEvidenceItem[];
+  reasons: string[];
+  markerPrice: number | null;
+  barTime: number | null;
+  barIndex: number | null;
+  deltaAgainstCount: number;
+  pocAgainstCount: number;
+  cumDeltaBroken: boolean;
+}
+
+interface ObjectiveDepthEvaluation {
+  score: number;
+  evidence: InvalidationEvidenceItem[];
+  reasons: string[];
+  markerPrice: number | null;
+  barTime: number | null;
+  barIndex: number | null;
+  severeEvent: boolean;
+  depthPressureStrong: boolean;
+  lastSweep: DepthSweepEvent | null;
+  ofiAgainst: number;
+  ofiAgainstCount: number;
+  replenishment: number;
+}
+
+interface ObjectiveEvaluation {
+  prints: ObjectivePrintsEvaluation;
+  depth: ObjectiveDepthEvaluation;
+  doubleConfirmed: boolean;
 }
 
 function createSummaryAccumulator(): SummaryAccumulator {
@@ -330,6 +505,8 @@ export class TradingEngine {
 
   private daily: DailyPerformance;
 
+  private objectiveKpis: ObjectiveInvalidationKpis;
+
   private lastPrice: number | null = null;
 
   private lastTimestamp = 0;
@@ -343,9 +520,15 @@ export class TradingEngine {
     const providedSettings = options.settings ?? {};
     const {
       invalidations: providedInvalidations,
+      objectiveInvalidation: providedObjectiveInvalidation,
       guardrails: providedGuardrails,
       ...restSettings
     } = providedSettings;
+
+    const mergedObjective = normalizeObjectiveSettings({
+      ...DEFAULT_OBJECTIVE_INVALIDATION_SETTINGS,
+      ...(providedObjectiveInvalidation ?? {}),
+    });
 
     this.settings = {
       ...DEFAULT_TRADING_SETTINGS,
@@ -354,6 +537,7 @@ export class TradingEngine {
         ...DEFAULT_INVALIDATION_SETTINGS,
         ...(providedInvalidations ?? {}),
       },
+      objectiveInvalidation: mergedObjective,
       guardrails: cloneGuardrailSettings(DEFAULT_GUARDRAIL_SETTINGS),
     };
 
@@ -376,12 +560,14 @@ export class TradingEngine {
     const day = this.getCurrentDayKey();
     const trades = this.history.filter((trade) => trade.day === day);
     this.daily = createDailyPerformance(day, trades, riskFraction);
+    this.objectiveKpis = this.buildObjectiveKpis();
   }
 
   get defaultSettings(): TradingSettings {
     return {
       ...DEFAULT_TRADING_SETTINGS,
       invalidations: { ...DEFAULT_INVALIDATION_SETTINGS },
+      objectiveInvalidation: { ...DEFAULT_OBJECTIVE_INVALIDATION_SETTINGS },
       guardrails: cloneGuardrailSettings(DEFAULT_GUARDRAIL_SETTINGS),
     };
   }
@@ -390,6 +576,7 @@ export class TradingEngine {
     return {
       ...this.settings,
       invalidations: { ...this.settings.invalidations },
+      objectiveInvalidation: { ...this.settings.objectiveInvalidation },
       guardrails: cloneGuardrailSettings(this.settings.guardrails),
     };
   }
@@ -418,7 +605,12 @@ export class TradingEngine {
   }
 
   updateSettings(partial: Partial<TradingSettings>): boolean {
-    const { invalidations: invalidationPartial, guardrails: guardrailPartial, ...rest } = partial;
+    const {
+      invalidations: invalidationPartial,
+      objectiveInvalidation: objectivePartial,
+      guardrails: guardrailPartial,
+      ...rest
+    } = partial;
 
     const nextInvalidations: InvalidationSettings = {
       ...this.settings.invalidations,
@@ -439,6 +631,13 @@ export class TradingEngine {
     nextInvalidations.liquidityRetracePercent = clamp(nextInvalidations.liquidityRetracePercent, 0, 1);
     nextInvalidations.keyLevelDeltaThreshold = clamp(nextInvalidations.keyLevelDeltaThreshold, 0, 1);
 
+    const nextObjective = objectivePartial
+      ? normalizeObjectiveSettings({
+          ...this.settings.objectiveInvalidation,
+          ...objectivePartial,
+        })
+      : this.settings.objectiveInvalidation;
+
     let guardrailsChanged = false;
     let guardrailSettings = this.settings.guardrails;
     if (guardrailPartial !== undefined) {
@@ -450,6 +649,7 @@ export class TradingEngine {
       ...this.settings,
       ...rest,
       invalidations: nextInvalidations,
+      objectiveInvalidation: nextObjective,
       guardrails: guardrailSettings,
     };
 
@@ -724,6 +924,7 @@ export class TradingEngine {
     this.closed = this.closed.filter((trade) => trade.day !== targetDay);
     this.guardrails.reset(this.now());
     this.updateDailyPerformance();
+    this.objectiveKpis = this.buildObjectiveKpis();
     this.bumpVersion();
   }
 
@@ -788,6 +989,7 @@ export class TradingEngine {
       settings: {
         ...this.settings,
         invalidations: { ...this.settings.invalidations },
+        objectiveInvalidation: { ...this.settings.objectiveInvalidation },
       },
       pending: clonePending(this.pending),
       positions: clonePositions(this.positions),
@@ -821,6 +1023,7 @@ export class TradingEngine {
       })),
       timeline: this.timeline.map((entry) => ({ ...entry })),
       guardrails: this.guardrails.getState(),
+      kpis: cloneObjectiveKpis(this.objectiveKpis),
       version: this.version,
     };
   }
@@ -830,6 +1033,7 @@ export class TradingEngine {
       settings: {
         ...this.settings,
         invalidations: { ...this.settings.invalidations },
+        objectiveInvalidation: { ...this.settings.objectiveInvalidation },
         guardrails: cloneGuardrailSettings(this.settings.guardrails),
       },
       history: cloneClosed(this.history),
@@ -977,6 +1181,13 @@ export class TradingEngine {
       lastInvalidationAt: 0,
       lastScore: 0,
       lastTriggers: [],
+      objectiveStartAt: null,
+      objectiveStartBar: null,
+      objectiveActiveThreshold: null,
+      objectiveLastScore: 0,
+      objectiveLastComponents: null,
+      objectiveLastReasons: [],
+      objectiveLastEventId: null,
     };
 
     if (!existing) {
@@ -986,6 +1197,27 @@ export class TradingEngine {
       meta.entryCumDelta = meta.entryCumDelta ?? bar?.cumulativeDelta ?? null;
       meta.entryPoc = meta.entryPoc ?? bar?.pocPrice ?? null;
       meta.entrySignalScore = meta.entrySignalScore ?? signal?.score ?? null;
+      if (typeof meta.objectiveStartAt === "undefined") {
+        meta.objectiveStartAt = null;
+      }
+      if (typeof meta.objectiveStartBar === "undefined") {
+        meta.objectiveStartBar = null;
+      }
+      if (typeof meta.objectiveActiveThreshold === "undefined") {
+        meta.objectiveActiveThreshold = null;
+      }
+      if (typeof meta.objectiveLastScore !== "number") {
+        meta.objectiveLastScore = 0;
+      }
+      if (!meta.objectiveLastComponents) {
+        meta.objectiveLastComponents = null;
+      }
+      if (!Array.isArray(meta.objectiveLastReasons)) {
+        meta.objectiveLastReasons = [];
+      }
+      if (typeof meta.objectiveLastEventId === "undefined") {
+        meta.objectiveLastEventId = null;
+      }
     }
 
     if (bar && typeof index === "number" && index >= 0 && position.entryBarIndex < 0) {
@@ -1037,6 +1269,868 @@ export class TradingEngine {
   }
 
   private evaluateInvalidations(context: InvalidationEvaluationContext): boolean {
+    const objective = this.settings.objectiveInvalidation;
+    if (objective && objective.enabled) {
+      return this.evaluateObjectiveInvalidations(context, objective);
+    }
+    return this.evaluateLegacyInvalidations(context);
+  }
+
+  private evaluateObjectiveInvalidations(
+    context: InvalidationEvaluationContext,
+    settings: ObjectiveInvalidationSettings,
+  ): boolean {
+    if (!this.positions.length) {
+      return false;
+    }
+
+    const now = context.now;
+    const bars = this.lastBars;
+    let changed = false;
+    const autoCloseQueue: Array<{ positionId: string; price: number; eventId: string; timestamp: number }> = [];
+
+    for (const position of this.positions) {
+      this.initializePositionMeta(position);
+      const meta = this.positionMeta.get(position.id);
+      if (!meta) {
+        continue;
+      }
+
+      const prints = this.computeObjectivePrints({
+        position,
+        meta,
+        bars,
+        settings,
+      });
+      const depth = this.computeObjectiveDepth({
+        position,
+        meta,
+        bars,
+        settings,
+        now,
+      });
+
+      const doubleConfirmed =
+        prints.score >= settings.printsThreshold && depth.score >= settings.depthThreshold;
+
+      const direction = directionFromSide(position.side);
+      const lastMarkerPrice =
+        depth.markerPrice ?? prints.markerPrice ?? position.lastPrice ?? position.entryPrice;
+
+      let strategyCompliant = true;
+      if (position.strategy === "poc-migration") {
+        const closeAgainst =
+          lastMarkerPrice !== null
+            ? direction > 0
+              ? lastMarkerPrice < position.entryPrice - this.priceStep * 0.25
+              : lastMarkerPrice > position.entryPrice + this.priceStep * 0.25
+            : false;
+        if (prints.pocAgainstCount < 2 || !closeAgainst) {
+          strategyCompliant = false;
+        }
+      } else if (position.strategy === "absorption-failure") {
+        if (depth.replenishment < 1.2 || depth.ofiAgainstCount < Math.max(1, settings.persistenceBars - 1)) {
+          strategyCompliant = false;
+        }
+      }
+
+      if (!doubleConfirmed || !strategyCompliant) {
+        meta.objectiveStartAt = null;
+        meta.objectiveStartBar = null;
+        meta.objectiveLastScore = clamp(
+          Math.round(prints.score * settings.printsWeight + depth.score * settings.depthWeight),
+          0,
+          100,
+        );
+        meta.objectiveLastComponents = { prints: prints.score, depth: depth.score };
+        meta.objectiveLastReasons = [...prints.reasons, ...depth.reasons];
+        continue;
+      }
+
+      const latestBarIndex = bars.length ? bars.length - 1 : null;
+      if (meta.objectiveStartAt === null) {
+        meta.objectiveStartAt = now;
+        meta.objectiveStartBar = latestBarIndex;
+      }
+
+      let persistenceSatisfied =
+        meta.objectiveStartAt !== null &&
+        now - meta.objectiveStartAt >= settings.persistenceSeconds * 1_000;
+
+      if (!persistenceSatisfied && meta.objectiveStartBar !== null && latestBarIndex !== null) {
+        const elapsedBars = latestBarIndex - meta.objectiveStartBar + 1;
+        if (elapsedBars >= settings.persistenceBars) {
+          persistenceSatisfied = true;
+        }
+      }
+
+      const combinedBaseScore = clamp(
+        Math.round(prints.score * settings.printsWeight + depth.score * settings.depthWeight),
+        0,
+        100,
+      );
+
+      if (!persistenceSatisfied) {
+        meta.objectiveLastScore = combinedBaseScore;
+        meta.objectiveLastComponents = { prints: prints.score, depth: depth.score };
+        meta.objectiveLastReasons = [...prints.reasons, ...depth.reasons];
+        continue;
+      }
+
+      const elapsedSinceEntry = now - position.entryTime;
+      const severeOverride = depth.severeEvent;
+      if (elapsedSinceEntry < settings.gracePeriodSeconds * 1_000 && !severeOverride) {
+        meta.objectiveLastScore = combinedBaseScore;
+        meta.objectiveLastComponents = { prints: prints.score, depth: depth.score };
+        meta.objectiveLastReasons = [...prints.reasons, ...depth.reasons];
+        continue;
+      }
+
+      const timeDecay = this.evaluateObjectiveTimeDecay({
+        position,
+        bars,
+        settings,
+        direction,
+        now,
+      });
+
+      let combinedScore = combinedBaseScore;
+      if (timeDecay.escalated) {
+        combinedScore = Math.max(combinedScore, settings.highThreshold);
+      }
+
+      const thresholds = {
+        severe: settings.severeThreshold,
+        high: settings.highThreshold,
+        medium: settings.mediumThreshold,
+      };
+
+      if (combinedScore < thresholds.medium) {
+        meta.objectiveLastScore = combinedScore;
+        meta.objectiveLastComponents = { prints: prints.score, depth: depth.score };
+        meta.objectiveLastReasons = [...prints.reasons, ...depth.reasons, ...timeDecay.reasons];
+        continue;
+      }
+
+      const activeThreshold = meta.objectiveActiveThreshold;
+      if (
+        activeThreshold !== null &&
+        combinedScore < activeThreshold - settings.hysteresisPoints
+      ) {
+        meta.objectiveActiveThreshold = null;
+      }
+
+      const objectiveLevel: "severe" | "high" | "medium" =
+        combinedScore >= thresholds.severe
+          ? "severe"
+          : combinedScore >= thresholds.high
+            ? "high"
+            : "medium";
+
+      const severity: InvalidationSeverity =
+        objectiveLevel === "medium" ? "medium" : "high";
+
+      const thresholdValue =
+        objectiveLevel === "severe"
+          ? thresholds.severe
+          : objectiveLevel === "high"
+            ? thresholds.high
+            : thresholds.medium;
+
+      const lastEvent =
+        meta.objectiveLastEventId &&
+        this.invalidations.find((event) => event.id === meta.objectiveLastEventId);
+      const lastEventActive = Boolean(lastEvent && !lastEvent.resolved && lastEvent.positionOpen);
+      const isUpgrade =
+        activeThreshold !== null && thresholdValue > activeThreshold;
+
+      if (lastEventActive && !isUpgrade) {
+        meta.objectiveLastScore = combinedScore;
+        meta.objectiveLastComponents = { prints: prints.score, depth: depth.score };
+        meta.objectiveLastReasons = [...prints.reasons, ...depth.reasons, ...timeDecay.reasons];
+        continue;
+      }
+
+      const persistenceSeconds =
+        meta.objectiveStartAt !== null
+          ? Math.max(0, Math.round((now - meta.objectiveStartAt) / 1000))
+          : 0;
+
+      const winnerProtected = this.isWinnerProtected({
+        position,
+        depth,
+        settings,
+      });
+
+      const breakdown: ObjectiveInvalidationBreakdown = {
+        printsScore: prints.score,
+        depthScore: depth.score,
+        persistenceSeconds,
+        reasons: Array.from(
+          new Set([...prints.reasons, ...depth.reasons, ...timeDecay.reasons]),
+        ),
+        timeDecayEscalated: timeDecay.escalated,
+        winnerProtected,
+      };
+
+      const triggers: TriggerResult[] = [
+        this.buildObjectivePrintsTrigger(prints, position, lastMarkerPrice),
+        this.buildObjectiveDepthTrigger(depth, position, lastMarkerPrice),
+      ];
+      if (timeDecay.trigger) {
+        triggers.push(timeDecay.trigger);
+      }
+
+      const event = this.buildObjectiveInvalidationEvent({
+        position,
+        now,
+        score: combinedScore,
+        level: objectiveLevel,
+        severity,
+        triggers,
+        prints,
+        depth,
+        breakdown,
+        settings,
+        winnerProtected,
+        markerPrice: lastMarkerPrice,
+      });
+
+      this.invalidations.push(event);
+      if (this.invalidations.length > MAX_INVALIDATION_EVENTS) {
+        this.invalidations.splice(0, this.invalidations.length - MAX_INVALIDATION_EVENTS);
+      }
+
+      meta.lastInvalidationAt = now;
+      meta.lastScore = event.score;
+      meta.lastTriggers = event.triggers.map((item) => item.id);
+      meta.objectiveActiveThreshold = thresholdValue;
+      meta.objectiveLastScore = combinedScore;
+      meta.objectiveLastComponents = { prints: prints.score, depth: depth.score };
+      meta.objectiveLastReasons = breakdown.reasons;
+      meta.objectiveLastEventId = event.id;
+
+      this.appendTimelineForEvent(event, position);
+
+      if (event.autoClosed) {
+        autoCloseQueue.push({
+          positionId: position.id,
+          price: event.price,
+          eventId: event.id,
+          timestamp: event.timestamp,
+        });
+      }
+
+      changed = true;
+    }
+
+    for (const action of autoCloseQueue) {
+      this.flattenPosition(action.positionId, action.price, "invalidation");
+      const event = this.invalidations.find((item) => item.id === action.eventId);
+      if (event) {
+        event.resolved = true;
+        event.positionOpen = false;
+        event.autoClosed = true;
+        event.actionTaken = "close";
+        this.resolveTimelineEvent(event.id, "close", true, action.timestamp);
+      }
+    }
+
+    if (changed) {
+      this.objectiveKpis = this.buildObjectiveKpis();
+    }
+
+    return changed;
+  }
+
+  private computeObjectivePrints(params: {
+    position: Position;
+    meta: PositionMeta;
+    bars: FootprintBar[];
+    settings: ObjectiveInvalidationSettings;
+  }): ObjectivePrintsEvaluation {
+    const { position, meta, bars, settings } = params;
+    const direction = directionFromSide(position.side);
+    const lookback = Math.max(settings.persistenceBars + 1, 3);
+    const subset = bars.slice(-lookback);
+    if (!subset.length) {
+      return {
+        score: 0,
+        evidence: [],
+        reasons: [],
+        markerPrice: null,
+        barTime: null,
+        barIndex: null,
+        deltaAgainstCount: 0,
+        pocAgainstCount: 0,
+        cumDeltaBroken: false,
+      };
+    }
+
+    let deltaAgainstCount = 0;
+    let pocAgainstCount = 0;
+    const entryPoc = meta.entryPoc ?? position.entryPrice;
+    const entryCum = meta.entryCumDelta;
+    let minCum = entryCum ?? Number.POSITIVE_INFINITY;
+    let maxCum = entryCum ?? Number.NEGATIVE_INFINITY;
+
+    const evidence: InvalidationEvidenceItem[] = [];
+    const reasons: string[] = [];
+
+    for (const bar of subset) {
+      if (direction * bar.totalDelta < 0) {
+        deltaAgainstCount += 1;
+      }
+      const barPoc = typeof bar.pocPrice === "number" ? bar.pocPrice : bar.closePrice;
+      if (
+        direction > 0
+          ? barPoc < entryPoc - this.priceStep * 0.25
+          : barPoc > entryPoc + this.priceStep * 0.25
+      ) {
+        pocAgainstCount += 1;
+      }
+      if (entryCum !== null && entryCum !== undefined) {
+        minCum = Math.min(minCum, bar.cumulativeDelta);
+        maxCum = Math.max(maxCum, bar.cumulativeDelta);
+      }
+    }
+
+    let score = 0;
+
+    if (deltaAgainstCount >= Math.min(subset.length, settings.persistenceBars)) {
+      const ratio = deltaAgainstCount / subset.length;
+      const component = Math.min(45, 25 + ratio * 40);
+      score += component;
+      evidence.push({
+        label: "Δ contrario",
+        value: `${deltaAgainstCount}/${subset.length}`,
+      });
+      reasons.push(`Delta contrario en ${deltaAgainstCount}/${subset.length} velas`);
+    }
+
+    if (pocAgainstCount >= 2) {
+      score += 30;
+      evidence.push({
+        label: "POC contra",
+        value: `${pocAgainstCount}`,
+      });
+      reasons.push(`POC desplazado contra la entrada (${pocAgainstCount})`);
+    }
+
+    const lastBar = subset[subset.length - 1];
+    const closeAgainst =
+      direction > 0
+        ? lastBar.closePrice < position.entryPrice - this.priceStep * 0.25
+        : lastBar.closePrice > position.entryPrice + this.priceStep * 0.25;
+    if (closeAgainst) {
+      score += 15;
+      evidence.push({ label: "Cierre", value: lastBar.closePrice.toFixed(2) });
+      reasons.push(`Cierre por el lado opuesto (${lastBar.closePrice.toFixed(2)})`);
+    }
+
+    let cumDeltaBroken = false;
+    if (entryCum !== null && entryCum !== undefined) {
+      cumDeltaBroken = direction > 0 ? minCum < entryCum : maxCum > entryCum;
+      if (cumDeltaBroken) {
+        score += 15;
+        const reference = direction > 0 ? minCum : maxCum;
+        evidence.push({
+          label: "CumΔ",
+          value: reference.toFixed(2),
+        });
+        reasons.push("CumΔ revierte la zona de entrada");
+      }
+    }
+
+    score = Math.min(100, score);
+
+    const barIndex = bars.indexOf(lastBar);
+
+    return {
+      score,
+      evidence,
+      reasons,
+      markerPrice: lastBar.closePrice,
+      barTime: lastBar.endTime,
+      barIndex: barIndex >= 0 ? barIndex : null,
+      deltaAgainstCount,
+      pocAgainstCount,
+      cumDeltaBroken,
+    };
+  }
+
+  private computeObjectiveDepth(params: {
+    position: Position;
+    meta: PositionMeta;
+    bars: FootprintBar[];
+    settings: ObjectiveInvalidationSettings;
+    now: number;
+  }): ObjectiveDepthEvaluation {
+    const { position, bars, settings, now } = params;
+    const direction = directionFromSide(position.side);
+    const lookback = Math.max(settings.persistenceBars + 1, 3);
+    const subset = bars.slice(-lookback);
+    if (!subset.length) {
+      return {
+        score: 0,
+        evidence: [],
+        reasons: [],
+        markerPrice: null,
+        barTime: null,
+        barIndex: null,
+        severeEvent: false,
+        depthPressureStrong: false,
+        lastSweep: null,
+        ofiAgainst: 0,
+        ofiAgainstCount: 0,
+        replenishment: 1,
+      };
+    }
+
+    let ofiAgainst = 0;
+    let ofiAgainstCount = 0;
+    let replenishment = 1;
+    let lastSweep: DepthSweepEvent | null = null;
+    let score = 0;
+    const evidence: InvalidationEvidenceItem[] = [];
+    const reasons: string[] = [];
+
+    for (const bar of subset) {
+      const depth = bar.depth;
+      if (!depth) {
+        continue;
+      }
+
+      const ofi = depth.avgOfi;
+      const ofiIsAgainst = direction > 0 ? ofi < 0 : ofi > 0;
+      if (ofiIsAgainst) {
+        ofiAgainst += Math.abs(ofi);
+        ofiAgainstCount += 1;
+      }
+
+      const sideReplenishment = direction > 0 ? depth.maxReplenishmentAsk : depth.maxReplenishmentBid;
+      replenishment = Math.max(replenishment, sideReplenishment);
+
+      if (Array.isArray(depth.sweeps)) {
+        for (const sweep of depth.sweeps) {
+          const sweepAgainst =
+            (direction > 0 && sweep.direction === "down") ||
+            (direction < 0 && sweep.direction === "up");
+          if (!sweepAgainst) {
+            continue;
+          }
+          if (
+            sweep.levelsCleared >= settings.severeSweepLevels &&
+            sweep.priceMoveTicks >= settings.severeSweepMinTicks
+          ) {
+            if (!lastSweep || (sweep.detectedAt ?? 0) > (lastSweep.detectedAt ?? 0)) {
+              lastSweep = sweep;
+            }
+          }
+        }
+      }
+    }
+
+    if (ofiAgainstCount >= Math.max(1, settings.persistenceBars - 1)) {
+      const ratio = ofiAgainstCount / subset.length;
+      const component = Math.min(40, 18 + ratio * 40);
+      score += component;
+      evidence.push({
+        label: "OFI contra",
+        value: `${ofiAgainstCount}/${subset.length}`,
+      });
+      reasons.push(`OFI contra en ${ofiAgainstCount}/${subset.length} velas`);
+    }
+
+    if (replenishment > 1.2) {
+      const component = Math.min(35, (replenishment - 1) * 40);
+      score += component;
+      evidence.push({ label: "Replenish", value: replenishment.toFixed(2) });
+      reasons.push(`Replenishment sostenido (${replenishment.toFixed(2)})`);
+    }
+
+    let severeEvent = false;
+    if (lastSweep) {
+      const withinWindow =
+        typeof lastSweep.detectedAt === "number"
+          ? now - lastSweep.detectedAt <= settings.severeSweepWindowMs
+          : true;
+      if (withinWindow) {
+        severeEvent = true;
+        score += 40;
+        evidence.push({
+          label: "Sweep",
+          value: `${lastSweep.levelsCleared} niveles`,
+        });
+        reasons.push(
+          `Barrida de liquidez (${lastSweep.levelsCleared} niveles · ${lastSweep.priceMoveTicks} ticks)`,
+        );
+      }
+    }
+
+    score = Math.min(100, score);
+
+    const lastDepthBar = [...subset].reverse().find((bar) => bar.depth);
+    const markerPrice = lastDepthBar ? lastDepthBar.closePrice : null;
+    const barIndex = lastDepthBar ? bars.indexOf(lastDepthBar) : -1;
+
+    return {
+      score,
+      evidence,
+      reasons,
+      markerPrice,
+      barTime: lastDepthBar?.endTime ?? null,
+      barIndex: barIndex >= 0 ? barIndex : null,
+      severeEvent,
+      depthPressureStrong: score >= settings.winnerProtectDepthThreshold,
+      lastSweep,
+      ofiAgainst,
+      ofiAgainstCount,
+      replenishment,
+    };
+  }
+
+  private evaluateObjectiveTimeDecay(params: {
+    position: Position;
+    bars: FootprintBar[];
+    settings: ObjectiveInvalidationSettings;
+    direction: 1 | -1;
+    now: number;
+  }): {
+    escalated: boolean;
+    trigger: TriggerResult | null;
+    reasons: string[];
+  } {
+    const { position, bars, settings, direction, now } = params;
+    const elapsedMinutes = (now - position.entryTime) / 60_000;
+    if (elapsedMinutes < settings.timeDecayMinutes) {
+      return { escalated: false, trigger: null, reasons: [] };
+    }
+    if (position.mfe >= settings.timeDecayMinMfe) {
+      return { escalated: false, trigger: null, reasons: [] };
+    }
+
+    const lookback = Math.max(1, settings.timeDecayContraBars);
+    const subset = bars.slice(-lookback);
+    if (!subset.length) {
+      return { escalated: false, trigger: null, reasons: [] };
+    }
+
+    let deltaAgainstCount = 0;
+    let ofiAgainstCount = 0;
+
+    for (const bar of subset) {
+      if (direction * bar.totalDelta < -settings.timeDecayDeltaThreshold) {
+        deltaAgainstCount += 1;
+      }
+      const depth = bar.depth;
+      if (depth) {
+        const ofi = depth.avgOfi;
+        if (direction > 0 ? ofi < -settings.timeDecayOfiThreshold : ofi > settings.timeDecayOfiThreshold) {
+          ofiAgainstCount += 1;
+        }
+      }
+    }
+
+    if (deltaAgainstCount < lookback || ofiAgainstCount < Math.max(1, lookback - 1)) {
+      return { escalated: false, trigger: null, reasons: [] };
+    }
+
+    const reasons = [
+      `Hold ${elapsedMinutes.toFixed(1)}m sin progreso (< ${settings.timeDecayMinMfe.toFixed(2)}R)`,
+      `Delta y OFI en contra (${deltaAgainstCount}/${lookback})`,
+    ];
+
+    const severity = clamp(0.6 + (elapsedMinutes - settings.timeDecayMinutes) / settings.timeDecayMinutes, 0.6, 1.2);
+    const trigger: TriggerResult = {
+      id: "objective-time-decay",
+      severity,
+      evidence: [
+        { label: "Hold", value: `${elapsedMinutes.toFixed(1)}m` },
+        { label: "MFE", value: `${position.mfe.toFixed(2)}R` },
+      ],
+      markerPrice: subset[subset.length - 1].closePrice,
+      barTime: subset[subset.length - 1].endTime,
+      barIndex: bars.length ? bars.length - 1 : null,
+      thesis: {
+        summary: "Time decay sin avance",
+        prints: [
+          `Delta en contra en ${deltaAgainstCount}/${lookback} velas`,
+        ],
+        depth: [
+          `OFI en contra en ${ofiAgainstCount}/${lookback} velas`,
+        ],
+      },
+    };
+
+    return { escalated: true, trigger, reasons };
+  }
+
+  private isWinnerProtected(params: {
+    position: Position;
+    depth: ObjectiveDepthEvaluation;
+    settings: ObjectiveInvalidationSettings;
+  }): boolean {
+    const { position, depth, settings } = params;
+    const direction = directionFromSide(position.side);
+    const riskPerUnit = Math.max(position.riskPerUnit, PRICE_EPSILON);
+    const distanceToTp1 = (position.target1 - position.lastPrice) * direction;
+    const distanceToTp1R = distanceToTp1 / riskPerUnit;
+    const nearTp1 = distanceToTp1R <= settings.winnerProtectTp1DistanceR + 1e-6;
+    const mfeProtected = position.mfe >= settings.winnerProtectMfeR - 1e-6;
+
+    if (!nearTp1 && !mfeProtected) {
+      return false;
+    }
+
+    if (depth.depthPressureStrong) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private buildObjectivePrintsTrigger(
+    evaluation: ObjectivePrintsEvaluation,
+    position: Position,
+    markerPrice: number,
+  ): TriggerResult {
+    return {
+      id: "objective-prints",
+      severity: clamp(evaluation.score / 100, 0, 1.2),
+      evidence: evaluation.evidence.slice(0, 5),
+      markerPrice,
+      barTime: evaluation.barTime,
+      barIndex: evaluation.barIndex,
+      thesis: {
+        summary: "Presión de prints contra la tesis",
+        prints: evaluation.reasons,
+        depth: [],
+      },
+    };
+  }
+
+  private buildObjectiveDepthTrigger(
+    evaluation: ObjectiveDepthEvaluation,
+    position: Position,
+    markerPrice: number,
+  ): TriggerResult {
+    return {
+      id: "objective-depth",
+      severity: clamp(evaluation.score / 100, 0, 1.2),
+      evidence: evaluation.evidence.slice(0, 5),
+      markerPrice,
+      barTime: evaluation.barTime,
+      barIndex: evaluation.barIndex,
+      thesis: {
+        summary: "L2/OFI valida la invalidación",
+        prints: [],
+        depth: evaluation.reasons,
+      },
+    };
+  }
+
+  private buildObjectiveInvalidationEvent(params: {
+    position: Position;
+    now: number;
+    score: number;
+    level: "severe" | "high" | "medium";
+    severity: InvalidationSeverity;
+    triggers: TriggerResult[];
+    prints: ObjectivePrintsEvaluation;
+    depth: ObjectiveDepthEvaluation;
+    breakdown: ObjectiveInvalidationBreakdown;
+    settings: ObjectiveInvalidationSettings;
+    winnerProtected: boolean;
+    markerPrice: number;
+  }): InvalidationEvent {
+    const { position, now, score, level, severity, triggers, breakdown, settings, winnerProtected, markerPrice } = params;
+
+    let recommendation: string;
+    let actions: InvalidationActionOption[] = [];
+    let suggestedAction: InvalidationActionType = "hold";
+    let autoClosed = false;
+
+    if (level === "severe" && !winnerProtected) {
+      recommendation = "Severo: cerrar 100% de la posición.";
+      actions = [
+        { ...INVALIDATION_ACTIONS.close },
+        { ...INVALIDATION_ACTIONS.reduce },
+        { ...INVALIDATION_ACTIONS["tighten-stop"] },
+      ];
+      suggestedAction = "close";
+      autoClosed = settings.autoCloseSevere;
+    } else if (level === "high") {
+      recommendation = "Alto: reducir 50% o mover el SL a -0.5R.";
+      actions = [
+        { ...INVALIDATION_ACTIONS.reduce },
+        { ...INVALIDATION_ACTIONS["tighten-stop"] },
+        { ...INVALIDATION_ACTIONS.hold },
+      ];
+      suggestedAction = "reduce";
+    } else {
+      recommendation = "Medio: monitorear y ajustar el SL si es necesario.";
+      actions = [
+        { ...INVALIDATION_ACTIONS["tighten-stop"] },
+        { ...INVALIDATION_ACTIONS.hold },
+      ];
+      suggestedAction = "tighten-stop";
+    }
+
+    if (winnerProtected) {
+      recommendation = "Protección de ganadora: mover SL a BE +0.5 tick y mantener.";
+      actions = [
+        { ...INVALIDATION_ACTIONS["tighten-stop"] },
+        { ...INVALIDATION_ACTIONS.hold },
+        { ...INVALIDATION_ACTIONS.reduce },
+      ];
+      suggestedAction = "tighten-stop";
+      autoClosed = false;
+    }
+
+    const event: InvalidationEvent = {
+      id: `${position.id}-${now}-${Math.random().toString(36).slice(2, 8)}`,
+      positionId: position.id,
+      positionSide: position.side,
+      strategy: position.strategy,
+      triggerId: triggers[0]?.id ?? "objective-prints",
+      triggerLabel: this.getTriggerLabel(triggers[0]?.id ?? "objective-prints"),
+      triggers: triggers.map((item) => ({ id: item.id, severity: clamp(item.severity, 0, 1.2) })),
+      policy: "objective",
+      breakdown,
+      score,
+      severity,
+      evidence: triggers.flatMap((trigger) => trigger.evidence).slice(0, 5),
+      recommendation,
+      thesis: {
+        summary: `Invalidación objetiva (${level})`,
+        prints: triggers[0]?.thesis?.prints ?? [],
+        depth: triggers[1]?.thesis?.depth ?? [],
+      },
+      actions,
+      suggestedAction,
+      timestamp: now,
+      session: position.session,
+      price: markerPrice ?? position.lastPrice ?? position.entryPrice,
+      barTime: triggers[0]?.barTime ?? null,
+      barIndex: triggers[0]?.barIndex ?? null,
+      autoClosed,
+      resolved: autoClosed,
+      actionTaken: autoClosed ? "close" : undefined,
+      positionOpen: !autoClosed,
+    };
+
+    if (autoClosed) {
+      event.resolved = true;
+      event.actionTaken = "close";
+    }
+
+    return event;
+  }
+
+  private appendTimelineForEvent(event: InvalidationEvent, position: Position): void {
+    const entry: TradingTimelineEntry = {
+      id: `${event.id}-timeline`,
+      timestamp: event.timestamp,
+      type: "invalidation",
+      eventId: event.id,
+      positionId: event.positionId,
+      signalId: position.signalId,
+      triggerLabel: event.triggerLabel,
+      severity: event.severity,
+      recommendation: event.recommendation,
+      suggestedAction: event.suggestedAction,
+      status: event.autoClosed ? "resolved" : "pending",
+      autoResolved: event.autoClosed,
+      resolvedAt: event.autoClosed ? event.timestamp : undefined,
+      thesisSummary: event.thesis.summary,
+    };
+
+    this.timeline.push(entry);
+    if (this.timeline.length > MAX_TIMELINE_ENTRIES) {
+      this.timeline.splice(0, this.timeline.length - MAX_TIMELINE_ENTRIES);
+    }
+  }
+
+  private resolveTimelineEvent(
+    eventId: string,
+    action: InvalidationActionType,
+    autoResolved: boolean,
+    resolvedAt: number,
+  ): void {
+    for (const entry of this.timeline) {
+      if (entry.eventId !== eventId) {
+        continue;
+      }
+      entry.status = "resolved";
+      entry.actionTaken = action;
+      entry.autoResolved = autoResolved;
+      entry.resolvedAt = resolvedAt;
+    }
+  }
+
+  private buildObjectiveKpis(): ObjectiveInvalidationKpis {
+    const day = this.getCurrentDayKey();
+    const events = this.invalidations.filter(
+      (event) => event.policy === "objective" && getDayKey(event.timestamp) === day,
+    );
+    const trades = this.history.filter((trade) => trade.day === day);
+    const tradeMap = new Map(trades.map((trade) => [trade.id, trade]));
+
+    const total = createObjectiveKpiAccumulator();
+    const perSession: Record<TradingSession, ObjectiveKpiAccumulator> = {
+      asia: createObjectiveKpiAccumulator(),
+      eu: createObjectiveKpiAccumulator(),
+      us: createObjectiveKpiAccumulator(),
+      other: createObjectiveKpiAccumulator(),
+    };
+    const perStrategy: Record<SignalStrategy, ObjectiveKpiAccumulator> = {
+      "absorption-failure": createObjectiveKpiAccumulator(),
+      "poc-migration": createObjectiveKpiAccumulator(),
+      "delta-divergence": createObjectiveKpiAccumulator(),
+    };
+
+    for (const event of events) {
+      const trade = tradeMap.get(event.positionId);
+      const buckets = [total, perSession[event.session], perStrategy[event.strategy]];
+
+      for (const bucket of buckets) {
+        bucket.events += 1;
+        if (!trade) {
+          continue;
+        }
+        bucket.tradeCount += 1;
+        const baselineR = trade.exitReason === "invalidation" ? -1 : trade.realizedR;
+        bucket.actualTotalR += trade.realizedR;
+        bucket.baselineTotalR += baselineR;
+        if (trade.exitReason === "invalidation") {
+          bucket.stopsAvoided += 1;
+          bucket.savedR += Math.max(0, -1 - trade.realizedR);
+        }
+        if (trade.firstHit === "tp1" || trade.firstHit === "tp2" || trade.exitReason === "tp2") {
+          bucket.falsePositives += 1;
+        }
+      }
+    }
+
+    return {
+      day,
+      total: finalizeObjectiveBucket(total),
+      perSession: {
+        asia: finalizeObjectiveBucket(perSession.asia),
+        eu: finalizeObjectiveBucket(perSession.eu),
+        us: finalizeObjectiveBucket(perSession.us),
+        other: finalizeObjectiveBucket(perSession.other),
+      },
+      perStrategy: {
+        "absorption-failure": finalizeObjectiveBucket(perStrategy["absorption-failure"]),
+        "poc-migration": finalizeObjectiveBucket(perStrategy["poc-migration"]),
+        "delta-divergence": finalizeObjectiveBucket(perStrategy["delta-divergence"]),
+      },
+    };
+  }
+
+  private evaluateLegacyInvalidations(context: InvalidationEvaluationContext): boolean {
     if (!this.positions.length) {
       return false;
     }
