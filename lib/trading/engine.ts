@@ -9,6 +9,7 @@ import type {
   InvalidationEvidenceItem,
   InvalidationSettings,
   InvalidationSeverity,
+  InvalidationThesis,
   InvalidationTriggerId,
   PendingTrade,
   Position,
@@ -21,6 +22,7 @@ import type {
   TradingSession,
   TradingSettings,
   TradingState,
+  TradingTimelineEntry,
 } from "@/types";
 import { DEFAULT_GUARDRAIL_SETTINGS, RiskGuardrailManager, cloneGuardrailSettings } from "@/lib/trading/guardrails";
 
@@ -72,6 +74,7 @@ const MAX_SIGNAL_CACHE = 400;
 const MAX_HISTORY = 2000;
 const MAX_CLOSED_CACHE = 120;
 const MAX_INVALIDATION_EVENTS = 240;
+const MAX_TIMELINE_ENTRIES = 200;
 const PRICE_EPSILON = 1e-8;
 const PNL_EPSILON = 1e-9;
 const INVALIDATION_COOLDOWN_MS = 60_000;
@@ -96,16 +99,16 @@ const AGGRESSIVENESS_MULTIPLIER: Record<InvalidationSettings["aggressiveness"], 
 };
 
 const INVALIDATION_ACTIONS: Record<InvalidationActionType, InvalidationActionOption> = {
-  close: { type: "close", label: "Cerrar ahora" },
+  close: { type: "close", label: "Cerrar" },
   reduce: { type: "reduce", label: "Reducir 50%" },
-  "tighten-stop": { type: "tighten-stop", label: "Mover SL (-0.5R)" },
+  "tighten-stop": { type: "tighten-stop", label: "Mover SL a BE (-0.5R)" },
   hold: { type: "hold", label: "Mantener" },
 };
 
 const INVALIDATION_RECOMMENDATIONS: Record<InvalidationSeverity, string> = {
-  high: "Se recomienda cerrar la posición de inmediato.",
-  medium: "Considera reducir exposición o ajustar el stop.",
-  low: "Mantener con stop ajustado y monitoreo cercano.",
+  high: "Cerrar la posición de inmediato.",
+  medium: "Reducir 50% y mover el SL a -0.5R.",
+  low: "Mantener y mover el SL a BE/-0.5R.",
 };
 
 function getDayKey(timestamp: number): string {
@@ -166,6 +169,12 @@ interface InvalidationEvaluationContext {
   signals?: FootprintSignal[];
 }
 
+interface TriggerNarrative {
+  summary?: string;
+  prints?: string[];
+  depth?: string[];
+}
+
 interface TriggerResult {
   id: InvalidationTriggerId;
   severity: number;
@@ -173,6 +182,7 @@ interface TriggerResult {
   markerPrice?: number;
   barTime?: number | null;
   barIndex?: number | null;
+  thesis?: TriggerNarrative;
 }
 
 function createSummaryAccumulator(): SummaryAccumulator {
@@ -311,6 +321,8 @@ export class TradingEngine {
   private history: ClosedTrade[] = [];
 
   private invalidations: InvalidationEvent[] = [];
+
+  private timeline: TradingTimelineEntry[] = [];
 
   private lastBars: FootprintBar[] = [];
 
@@ -801,7 +813,13 @@ export class TradingEngine {
         evidence: event.evidence.map((item) => ({ ...item })),
         actions: event.actions.map((action) => ({ ...action })),
         triggers: event.triggers.map((item) => ({ ...item })),
+        thesis: {
+          summary: event.thesis.summary,
+          prints: [...event.thesis.prints],
+          depth: [...event.thesis.depth],
+        },
       })),
+      timeline: this.timeline.map((entry) => ({ ...entry })),
       guardrails: this.guardrails.getState(),
       version: this.version,
     };
@@ -1193,6 +1211,43 @@ export class TradingEngine {
         { label: "Barras", value: `${barsSinceEntry}` },
       ];
 
+      const thesisPrints = [
+        `Señal ${signal.side === "long" ? "long" : "short"} ${formatStrategy(signal.strategy)}`,
+        `Confluencias: ${signal.strategies.length}`,
+        `Barras desde entrada: ${barsSinceEntry}`,
+      ];
+      const thesisDepth: string[] = [];
+      if (signal.l2) {
+        const confidence = Number.isFinite(signal.l2.confidence)
+          ? Math.round(signal.l2.confidence * 100)
+          : null;
+        if (signal.l2.confirmed && confidence !== null) {
+          thesisDepth.push(`L2 confirmado (${confidence}%)`);
+        } else if (confidence !== null) {
+          thesisDepth.push(`L2 parcial (${confidence}%)`);
+        }
+        if (signal.l2.reason) {
+          thesisDepth.push(signal.l2.reason);
+        }
+        if (signal.l2.absorption) {
+          const durationSec = signal.l2.absorption.durationMs / 1000;
+          const durationText = Number.isFinite(durationSec) ? `${durationSec.toFixed(1)}s` : "-";
+          const replenishment = signal.l2.absorption.replenishmentFactor;
+          const replenishmentText = Number.isFinite(replenishment) ? replenishment.toFixed(1) : "-";
+          thesisDepth.push(`Absorción ${durationText} · factor ${replenishmentText}`);
+        }
+        if (signal.l2.sweep) {
+          thesisDepth.push(
+            `Sweep ${signal.l2.sweep.levelsCleared} niveles (${signal.l2.sweep.priceMoveTicks} ticks)`,
+          );
+        }
+        if (signal.l2.spoof) {
+          thesisDepth.push(
+            `Spoof ${signal.l2.spoof.side === "bid" ? "bid" : "ask"} ${signal.l2.spoof.size.toFixed(0)}`,
+          );
+        }
+      }
+
       const result: TriggerResult = {
         id: "opposite-signal",
         severity,
@@ -1200,6 +1255,11 @@ export class TradingEngine {
         markerPrice: signal.entry,
         barTime: signal.barTime,
         barIndex: signal.barIndex,
+        thesis: {
+          summary: `Señal opuesta (${signal.score.toFixed(0)} pts)`,
+          prints: thesisPrints,
+          depth: thesisDepth,
+        },
       };
 
       if (!best || severity > best.severity) {
@@ -1291,6 +1351,18 @@ export class TradingEngine {
           { label: "Barra", value: new Date(bar.endTime).toLocaleTimeString() },
         ];
 
+        const stackLevels = Math.max(bestConsecutive, 1);
+        const referencePrice = typeof bestPrice === "number" ? bestPrice.toFixed(2) : "-";
+        const thesisPrints = [
+          `Stack de ${stackLevels} niveles`,
+          `Ratio medio: ${bestAverage.toFixed(2)}`,
+          `Nivel de presión: ${referencePrice}`,
+        ];
+        if (typeof bestPrice === "number") {
+          const distance = Math.abs(bestPrice - position.entryPrice);
+          thesisPrints.push(`Distancia vs entrada: ${distance.toFixed(2)}`);
+        }
+
         const result: TriggerResult = {
           id: "stacked-imbalance",
           severity,
@@ -1298,6 +1370,11 @@ export class TradingEngine {
           markerPrice: bestPrice,
           barTime: bar.endTime,
           barIndex: idx,
+          thesis: {
+            summary: `Imbalance apilado (${stackLevels} niveles)`,
+            prints: thesisPrints,
+            depth: [],
+          },
         };
 
         if (!bestResult || severity > bestResult.severity) {
@@ -1381,6 +1458,13 @@ export class TradingEngine {
       { label: "Cierre", value: lastClose.toFixed(2) },
     ];
 
+    const directionLabel = position.side === "long" ? "bajista" : "alcista";
+    const thesisPrints = [
+      `Delta ${directionLabel} sostenido (${avgDelta.toFixed(2)})`,
+      `Desplazamiento POC: ${pocShift.toFixed(2)}`,
+      `Cierre en ${lastClose.toFixed(2)}`,
+    ];
+
     return {
       id: "delta-poc-flip",
       severity,
@@ -1388,8 +1472,13 @@ export class TradingEngine {
       markerPrice: lastClose,
       barTime: lastBar.endTime,
       barIndex: bars.indexOf(lastBar),
+      thesis: {
+        summary: "Flip de delta + POC contra la entrada",
+        prints: thesisPrints,
+        depth: [],
+      },
     };
-  }
+
 
   private evaluateCumDeltaBreak(
     position: Position,
@@ -1437,6 +1526,16 @@ export class TradingEngine {
       { label: "Δ neto", value: deltaDrop.toFixed(2) },
     ];
 
+    const thesisPrints = [
+      `CumΔ entrada: ${entryCum.toFixed(2)}`,
+      `Actual: ${referenceCum.toFixed(2)}`,
+      `Delta neto: ${deltaDrop.toFixed(2)}`,
+    ];
+    const thesisSummary =
+      position.side === "long"
+        ? "CumΔ vendedor rompe la entrada"
+        : "CumΔ comprador rompe la entrada";
+
     return {
       id: "cumdelta-break",
       severity,
@@ -1444,6 +1543,11 @@ export class TradingEngine {
       markerPrice: lastBar.closePrice,
       barTime: lastBar.endTime,
       barIndex: bars.indexOf(lastBar),
+      thesis: {
+        summary: thesisSummary,
+        prints: thesisPrints,
+        depth: [],
+      },
     };
   }
 
@@ -1496,6 +1600,16 @@ export class TradingEngine {
       { label: "Δ ratio", value: deltaStrength.toFixed(2) },
     ];
 
+    const thesisPrints = [
+      `Cierre ${close.toFixed(2)}`,
+      `POC vs entrada: ${(poc - entryPoc).toFixed(2)}`,
+      `Δ ratio: ${deltaStrength.toFixed(2)}`,
+    ];
+    const thesisSummary =
+      position.side === "long"
+        ? "Re-captura bajista del nivel clave"
+        : "Re-captura alcista del nivel clave";
+
     return {
       id: "key-level-recapture",
       severity,
@@ -1503,8 +1617,13 @@ export class TradingEngine {
       markerPrice: close,
       barTime: lastBar.endTime,
       barIndex: bars.length - 1,
+      thesis: {
+        summary: thesisSummary,
+        prints: thesisPrints,
+        depth: [],
+      },
     };
-  }
+
 
   private evaluateTimeDecay(
     position: Position,
@@ -1535,6 +1654,11 @@ export class TradingEngine {
       { label: "MFE", value: `${position.mfe.toFixed(2)}R` },
     ];
 
+    const thesisPrints = [
+      `Hold ${elapsedMinutes.toFixed(1)}m`,
+      `MFE ${position.mfe.toFixed(2)}R`,
+    ];
+
     return {
       id: "time-decay",
       severity,
@@ -1542,8 +1666,13 @@ export class TradingEngine {
       markerPrice: position.lastPrice,
       barTime: null,
       barIndex: null,
+      thesis: {
+        summary: `Sin progreso tras ${elapsedMinutes.toFixed(1)}m`,
+        prints: thesisPrints,
+        depth: [],
+      },
     };
-  }
+
 
   private evaluateLiquiditySweep(
     position: Position,
@@ -1605,6 +1734,11 @@ export class TradingEngine {
     ];
 
     const markerPrice = direction > 0 ? lastBar.lowPrice : lastBar.highPrice;
+    const thesisDepth = [
+      `Barrida ${wick.toFixed(2)}`,
+      `Retrace ${(retrace * 100).toFixed(0)}%`,
+      `Volumen ${lastBar.totalVolume.toFixed(0)} (p${percentileVolume.toFixed(0)})`,
+    ];
 
     return {
       id: "liquidity-sweep",
@@ -1613,8 +1747,13 @@ export class TradingEngine {
       markerPrice,
       barTime: lastBar.endTime,
       barIndex: bars.length - 1,
+      thesis: {
+        summary: "Barrida de liquidez contra la entrada",
+        prints: [],
+        depth: thesisDepth,
+      },
     };
-  }
+
 
   private buildInvalidationEvent(args: {
     position: Position;

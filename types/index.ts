@@ -326,6 +326,12 @@ export interface InvalidationEvidenceItem {
   value: string;
 }
 
+export interface InvalidationThesis {
+  summary: string;
+  prints: string[];
+  depth: string[];
+}
+
 export interface FootprintSignal {
   id: string;
   timestamp: number;
@@ -416,7 +422,9 @@ export interface InvalidationEvent {
   severity: InvalidationSeverity;
   evidence: InvalidationEvidenceItem[];
   recommendation: string;
+  thesis: InvalidationThesis;
   actions: InvalidationActionOption[];
+  suggestedAction: InvalidationActionType;
   timestamp: number;
   session: TradingSession;
   price: number;
@@ -538,6 +546,24 @@ export interface DailyPerformance {
   byStrategy: Record<SignalStrategy, SummaryStats>;
 }
 
+export interface TradingTimelineEntry {
+  id: string;
+  timestamp: number;
+  type: "invalidation";
+  eventId: string;
+  positionId: string;
+  signalId?: string;
+  triggerLabel: string;
+  severity: InvalidationSeverity;
+  recommendation: string;
+  suggestedAction: InvalidationActionType;
+  actionTaken?: InvalidationActionType;
+  status: "pending" | "resolved";
+  autoResolved: boolean;
+  resolvedAt?: number;
+  thesisSummary?: string;
+}
+
 export interface TradingState {
   settings: TradingSettings;
   pending: PendingTrade[];
@@ -546,6 +572,13 @@ export interface TradingState {
   history: ClosedTrade[];
   daily: DailyPerformance;
   invalidations: InvalidationEvent[];
+  timeline: TradingTimelineEntry[];
   guardrails: RiskGuardrailState;
   version: number;
+}
+
+export interface NotificationPreferences {
+  soundEnabled: boolean;
+  autoCloseSeconds: number | null;
+  minSeverity: InvalidationSeverity;
 }
