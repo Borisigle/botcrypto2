@@ -233,6 +233,71 @@ export type SignalMode = "conservative" | "standard" | "aggressive";
 
 export type TradingSession = "asia" | "eu" | "us" | "other";
 
+export type RiskGuardrailStatus = "ok" | "limited" | "cooldown" | "locked";
+
+export type RiskGuardrailSource =
+  | "daily-loss"
+  | "daily-trades"
+  | "max-consecutive-losses"
+  | "session-trades"
+  | "session-loss"
+  | "cooldown"
+  | "news"
+  | "session-window";
+
+export interface RiskNewsWindow {
+  id: string;
+  label: string;
+  start: string;
+  end: string;
+}
+
+export interface RiskGuardrailSettings {
+  enabled: boolean;
+  maxDailyLossR: number | null;
+  maxTradesPerDay: number | null;
+  maxConsecutiveLosses: number | null;
+  perSessionMaxTrades: Partial<Record<TradingSession, number | null>>;
+  perSessionMaxLossR: Partial<Record<TradingSession, number | null>>;
+  lossCooldownTrigger: number;
+  lossCooldownMinutes: number;
+  dailyStopCooldownMinutes: number;
+  allowedSessions: TradingSession[];
+  newsWindows: RiskNewsWindow[];
+}
+
+export interface RiskGuardrailBlock {
+  source: RiskGuardrailSource;
+  reason: string;
+  until: number | null;
+  session?: TradingSession;
+}
+
+export interface RiskGuardrailLogEntry {
+  timestamp: number;
+  source: RiskGuardrailSource;
+  message: string;
+  signalId?: string;
+  auto: boolean;
+}
+
+export interface RiskGuardrailState {
+  status: RiskGuardrailStatus;
+  day: string;
+  resetAt: number;
+  tradesToday: number;
+  netRToday: number;
+  consecutiveLosses: number;
+  sessionStats: Record<TradingSession, { trades: number; netR: number; losses: number }>;
+  activeBlocks: RiskGuardrailBlock[];
+  cooldowns: {
+    lossUntil: number | null;
+    dailyStopUntil: number | null;
+  };
+  lastBlock: (RiskGuardrailBlock & { timestamp: number; signalId?: string; auto: boolean }) | null;
+  logs: RiskGuardrailLogEntry[];
+}
+
 export interface SignalEvidenceItem {
   label: string;
   value: string;
@@ -374,6 +439,7 @@ export interface TradingSettings {
   beOffsetTicks: number;
   invalidationBars: number;
   invalidations: InvalidationSettings;
+  guardrails: RiskGuardrailSettings;
 }
 
 export type TradeExitReason = "tp2" | "stop" | "breakeven" | "time-stop" | "invalidation" | "cancelled";
@@ -480,5 +546,6 @@ export interface TradingState {
   history: ClosedTrade[];
   daily: DailyPerformance;
   invalidations: InvalidationEvent[];
+  guardrails: RiskGuardrailState;
   version: number;
 }

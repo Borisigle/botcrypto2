@@ -2,6 +2,8 @@ import type {
   ConnectionDiagnostics,
   ConnectionStatus,
   FootprintMode,
+  RiskGuardrailState,
+  RiskGuardrailStatus,
   Timeframe,
 } from "@/types";
 
@@ -13,6 +15,7 @@ interface StatusBarProps {
   priceStep: number;
   barsCount: number;
   diagnostics: ConnectionDiagnostics;
+  guardrails: RiskGuardrailState;
   lastError?: string | null;
 }
 
@@ -26,6 +29,16 @@ const STATUS_STYLES: Record<
   disconnected: { label: "Disconnected", className: "bg-rose-500" },
 };
 
+const GUARDRAIL_STATUS_META: Record<
+  RiskGuardrailStatus,
+  { label: string; className: string; reasonClass: string }
+> = {
+  ok: { label: "OK", className: "text-emerald-200", reasonClass: "text-emerald-200" },
+  limited: { label: "Limitado", className: "text-sky-200", reasonClass: "text-sky-300/80" },
+  cooldown: { label: "Cooldown", className: "text-amber-200", reasonClass: "text-amber-300/80" },
+  locked: { label: "Bloqueado", className: "text-rose-300", reasonClass: "text-rose-300/80" },
+};
+
 export function StatusBar({
   status,
   mode,
@@ -34,6 +47,7 @@ export function StatusBar({
   priceStep,
   barsCount,
   diagnostics,
+  guardrails,
   lastError,
 }: StatusBarProps) {
   const statusMeta = STATUS_STYLES[status];
@@ -43,6 +57,10 @@ export function StatusBar({
   const gapTimestamp = formatUtcTime(diagnostics.lastGapFillAt);
   const gapRange = formatRange(diagnostics.gapFrom, diagnostics.gapTo);
   const gapTrades = diagnostics.gapTradeCount;
+  const guardrailMeta = GUARDRAIL_STATUS_META[guardrails.status];
+  const guardrailReason = guardrails.status === "ok"
+    ? null
+    : guardrails.activeBlocks[0]?.reason ?? guardrails.lastBlock?.reason ?? null;
 
   return (
     <footer className="flex flex-col gap-1 rounded-lg border border-white/5 bg-black/30 px-4 py-3 text-sm text-white/70">
@@ -57,6 +75,10 @@ export function StatusBar({
         <span className="flex items-center gap-2">
           <span className="font-semibold text-white/80">Mode</span>
           <span className={`font-mono ${modeClass}`}>{modeLabel}</span>
+        </span>
+        <span className="flex items-center gap-2">
+          <span className="font-semibold text-white/80">Guardrails</span>
+          <span className={`font-mono ${guardrailMeta.className}`}>{guardrailMeta.label}</span>
         </span>
         <span className="hidden h-4 w-px bg-white/10 sm:block" aria-hidden />
         <span className="flex items-center gap-2">
@@ -89,6 +111,9 @@ export function StatusBar({
           </span>
         </span>
       </div>
+      {guardrailReason ? (
+        <p className={`text-xs ${guardrailMeta.reasonClass}`}>Guardrail: {guardrailReason}</p>
+      ) : null}
       {gapTimestamp ? (
         <p className="text-xs text-emerald-300/80">
           Gap filled {gapTimestamp} UTC

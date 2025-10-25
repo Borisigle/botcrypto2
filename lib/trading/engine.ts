@@ -22,6 +22,7 @@ import type {
   TradingSettings,
   TradingState,
 } from "@/types";
+import { DEFAULT_GUARDRAIL_SETTINGS, RiskGuardrailManager, cloneGuardrailSettings } from "@/lib/trading/guardrails";
 
 const DEFAULT_INVALIDATION_SETTINGS: InvalidationSettings = {
   aggressiveness: "moderate",
@@ -51,7 +52,8 @@ const DEFAULT_TRADING_SETTINGS: TradingSettings = {
   retestWindowMinutes: 5,
   beOffsetTicks: 0.5,
   invalidationBars: 0,
-  invalidations: DEFAULT_INVALIDATION_SETTINGS,
+  invalidations: { ...DEFAULT_INVALIDATION_SETTINGS },
+  guardrails: cloneGuardrailSettings(DEFAULT_GUARDRAIL_SETTINGS),
 };
 
 interface TradingEngineOptions {
@@ -296,6 +298,8 @@ export class TradingEngine {
 
   private settings: TradingSettings;
 
+  private guardrails: RiskGuardrailManager;
+
   private signals = new Map<string, FootprintSignal>();
 
   private pending: PendingTrade[] = [];
@@ -325,7 +329,11 @@ export class TradingEngine {
     this.timeframeMs = options.timeframeMs;
 
     const providedSettings = options.settings ?? {};
-    const { invalidations: providedInvalidations, ...restSettings } = providedSettings;
+    const {
+      invalidations: providedInvalidations,
+      guardrails: providedGuardrails,
+      ...restSettings
+    } = providedSettings;
 
     this.settings = {
       ...DEFAULT_TRADING_SETTINGS,
@@ -334,7 +342,18 @@ export class TradingEngine {
         ...DEFAULT_INVALIDATION_SETTINGS,
         ...(providedInvalidations ?? {}),
       },
+      guardrails: cloneGuardrailSettings(DEFAULT_GUARDRAIL_SETTINGS),
     };
+
+    this.guardrails = new RiskGuardrailManager({
+      settings: {
+        ...this.settings.guardrails,
+        ...(providedGuardrails ?? {}),
+      },
+      now: Date.now(),
+    });
+
+    this.settings.guardrails = this.guardrails.getSettings();
 
     if (options.history?.length) {
       this.history = cloneClosed(options.history).slice(-MAX_HISTORY);
@@ -351,6 +370,7 @@ export class TradingEngine {
     return {
       ...DEFAULT_TRADING_SETTINGS,
       invalidations: { ...DEFAULT_INVALIDATION_SETTINGS },
+      guardrails: cloneGuardrailSettings(DEFAULT_GUARDRAIL_SETTINGS),
     };
   }
 
@@ -358,6 +378,7 @@ export class TradingEngine {
     return {
       ...this.settings,
       invalidations: { ...this.settings.invalidations },
+      guardrails: cloneGuardrailSettings(this.settings.guardrails),
     };
   }
 
@@ -385,7 +406,7 @@ export class TradingEngine {
   }
 
   updateSettings(partial: Partial<TradingSettings>): boolean {
-    const { invalidations: invalidationPartial, ...rest } = partial;
+    const { invalidations: invalidationPartial, guardrails: guardrailPartial, ...rest } = partial;
 
     const nextInvalidations: InvalidationSettings = {
       ...this.settings.invalidations,
@@ -406,10 +427,18 @@ export class TradingEngine {
     nextInvalidations.liquidityRetracePercent = clamp(nextInvalidations.liquidityRetracePercent, 0, 1);
     nextInvalidations.keyLevelDeltaThreshold = clamp(nextInvalidations.keyLevelDeltaThreshold, 0, 1);
 
+    let guardrailsChanged = false;
+    let guardrailSettings = this.settings.guardrails;
+    if (guardrailPartial !== undefined) {
+      guardrailsChanged = this.guardrails.updateSettings(guardrailPartial);
+      guardrailSettings = this.guardrails.getSettings();
+    }
+
     const next: TradingSettings = {
       ...this.settings,
       ...rest,
       invalidations: nextInvalidations,
+      guardrails: guardrailSettings,
     };
 
     next.partialTakePercent = clamp(next.partialTakePercent, 0, 1);
@@ -420,12 +449,16 @@ export class TradingEngine {
     next.beOffsetTicks = Math.max(0, next.beOffsetTicks);
     next.invalidationBars = Math.max(0, Math.floor(next.invalidationBars));
 
-    const changed = JSON.stringify(this.settings) !== JSON.stringify(next);
+    const changed = JSON.stringify(this.settings) !== JSON.stringify(next) || guardrailsChanged;
     if (!changed) {
       return false;
     }
 
-    this.settings = next;
+    this.settings = {
+      ...next,
+      invalidations: nextInvalidations,
+      guardrails: guardrailSettings,
+    };
     this.updateDailyPerformance();
     this.bumpVersion();
     return true;
@@ -444,8 +477,11 @@ export class TradingEngine {
         newSignals.push(signal);
         changed = true;
         if (this.settings.autoTake) {
-          const created = this.createPendingFromSignal(signal, true);
-          if (created) {
+          const { pending, guardrailsChanged } = this.createPendingFromSignal(signal, true);
+          if (pending) {
+            changed = true;
+          }
+          if (guardrailsChanged) {
             changed = true;
           }
         }
@@ -501,11 +537,15 @@ export class TradingEngine {
       return null;
     }
 
-    const created = this.createPendingFromSignal(signal, false);
-    if (created) {
+    const { pending, guardrailsChanged } = this.createPendingFromSignal(signal, false);
+    if (pending) {
+      this.bumpVersion();
+      return pending;
+    }
+    if (guardrailsChanged) {
       this.bumpVersion();
     }
-    return created;
+    return null;
   }
 
   cancelPending(id: string): boolean {
@@ -670,6 +710,7 @@ export class TradingEngine {
     const targetDay = day ?? this.getCurrentDayKey();
     this.history = this.history.filter((trade) => trade.day !== targetDay);
     this.closed = this.closed.filter((trade) => trade.day !== targetDay);
+    this.guardrails.reset(this.now());
     this.updateDailyPerformance();
     this.bumpVersion();
   }
@@ -761,6 +802,7 @@ export class TradingEngine {
         actions: event.actions.map((action) => ({ ...action })),
         triggers: event.triggers.map((item) => ({ ...item })),
       })),
+      guardrails: this.guardrails.getState(),
       version: this.version,
     };
   }
@@ -770,29 +812,43 @@ export class TradingEngine {
       settings: {
         ...this.settings,
         invalidations: { ...this.settings.invalidations },
+        guardrails: cloneGuardrailSettings(this.settings.guardrails),
       },
       history: cloneClosed(this.history),
     };
   }
 
-  private createPendingFromSignal(signal: FootprintSignal, auto: boolean): PendingTrade | null {
+  private createPendingFromSignal(signal: FootprintSignal, auto: boolean): {
+    pending: PendingTrade | null;
+    guardrailsChanged: boolean;
+  } {
+    const evaluation = this.guardrails.evaluateEntry({
+      now: this.now(),
+      signal,
+      auto,
+    });
+
     if (this.pending.some((item) => item.signalId === signal.id)) {
-      return null;
+      return { pending: null, guardrailsChanged: evaluation.changed };
     }
     if (this.positions.some((item) => item.signalId === signal.id)) {
-      return null;
+      return { pending: null, guardrailsChanged: evaluation.changed };
+    }
+
+    if (!evaluation.allowed) {
+      return { pending: null, guardrailsChanged: evaluation.changed };
     }
 
     const riskPerUnit = Math.abs(signal.entry - signal.stop);
     if (riskPerUnit < PRICE_EPSILON) {
-      return null;
+      return { pending: null, guardrailsChanged: evaluation.changed };
     }
 
     const direction = directionFromSide(signal.side);
     const providedTarget1 = Number.isFinite(signal.target1) ? signal.target1 : signal.entry + direction * riskPerUnit * 2;
     const rrToProvidedTarget = Math.abs(providedTarget1 - signal.entry) / Math.max(riskPerUnit, PRICE_EPSILON);
     if (rrToProvidedTarget + PRICE_EPSILON < 2) {
-      return null;
+      return { pending: null, guardrailsChanged: evaluation.changed };
     }
 
     const target1 = Number((signal.entry + direction * riskPerUnit * 2).toFixed(6));
@@ -817,7 +873,7 @@ export class TradingEngine {
     };
 
     this.pending.push(pending);
-    return pending;
+    return { pending, guardrailsChanged: evaluation.changed };
   }
 
   private openPositionFromPending(pending: PendingTrade, trade: Trade): Position | null {
@@ -1762,6 +1818,7 @@ export class TradingEngine {
       this.history.splice(0, this.history.length - MAX_HISTORY);
     }
 
+    this.guardrails.recordClosedTrade(closed);
     this.updateDailyPerformance();
   }
 
