@@ -1,5 +1,9 @@
-import { SignalEngine, createDefaultSignalControlState } from "@/lib/signals";
+import { DepthAnalytics } from "@/lib/depth";
+import { MODE_PRESETS, SignalEngine, createDefaultSignalControlState } from "@/lib/signals";
 import type {
+  DepthBarMetrics,
+  DepthState,
+  DepthStreamMessage,
   FootprintBar,
   FootprintSignal,
   FootprintState,
@@ -34,6 +38,7 @@ interface InternalBar {
   lowPrice: number;
   openPrice: number | null;
   closePrice: number | null;
+  depth?: DepthBarMetrics | null;
 }
 
 export function timeframeToMs(timeframe: string): number {
@@ -98,6 +103,10 @@ export class FootprintAggregator {
 
   private signalConfig: SignalControlState = createDefaultSignalControlState();
 
+  private depthAnalytics: DepthAnalytics;
+
+  private depthState: DepthState | null = null;
+
   private seenTradeIds = new Set<number>();
 
   private tradeIdQueue: number[] = [];
@@ -112,6 +121,11 @@ export class FootprintAggregator {
       timeframeMs: settings.timeframeMs,
       config: this.signalConfig,
     });
+    this.depthAnalytics = new DepthAnalytics({
+      timeframeMs: settings.timeframeMs,
+      priceStep: settings.priceStep,
+    });
+    this.applyDepthOverrides(this.signalConfig);
   }
 
   updateSettings(partial: Partial<AggregatorSettings>, options?: { reset?: boolean }) {
@@ -121,6 +135,10 @@ export class FootprintAggregator {
     this.signalEngine.updateSettings({
       priceStep: nextSettings.priceStep,
       timeframeMs: nextSettings.timeframeMs,
+    });
+    this.depthAnalytics.updateSettings({
+      timeframeMs: nextSettings.timeframeMs,
+      priceStep: nextSettings.priceStep,
     });
 
     if (options?.reset) {
@@ -145,6 +163,7 @@ export class FootprintAggregator {
     };
     this.signalEngine.reset();
     this.signalEngine.updateConfig(this.signalConfig);
+    this.applyDepthOverrides(this.signalConfig);
     this.recomputeSignals();
   }
 
@@ -154,6 +173,8 @@ export class FootprintAggregator {
     this.signals = [];
     this.signalStats = createInitialSignalStats();
     this.signalEngine.reset();
+    this.depthAnalytics.reset();
+    this.depthState = null;
     this.seenTradeIds.clear();
     this.tradeIdQueue = [];
     this.tradeIdQueueStart = 0;
@@ -162,6 +183,7 @@ export class FootprintAggregator {
   ingestTrades(trades: Trade[]): FootprintState {
     if (!trades.length) {
       const bars = this.recomputeSignals();
+      this.depthState = this.depthAnalytics.getDepthState();
       return this.buildState(bars);
     }
 
@@ -172,11 +194,39 @@ export class FootprintAggregator {
     this.prune();
 
     const bars = this.recomputeSignals();
+    this.depthState = this.depthAnalytics.getDepthState();
+    return this.buildState(bars);
+  }
+
+  ingestDepth(messages: DepthStreamMessage[]): FootprintState {
+    if (!messages.length) {
+      const bars = this.recomputeSignals();
+      this.depthState = this.depthAnalytics.getDepthState();
+      return this.buildState(bars);
+    }
+
+    for (const message of messages) {
+      try {
+        if (message.type === "snapshot") {
+          this.depthAnalytics.reset();
+          this.depthAnalytics.applySnapshot(message.snapshot);
+        } else {
+          this.depthAnalytics.applyDiff(message.diff);
+        }
+      } catch (error) {
+        console.warn("Depth ingestion error", error);
+        this.depthAnalytics.reset();
+      }
+    }
+
+    this.depthState = this.depthAnalytics.getDepthState();
+    const bars = this.recomputeSignals();
     return this.buildState(bars);
   }
 
   getState(): FootprintState {
     const bars = this.recomputeSignals();
+    this.depthState = this.depthAnalytics.getDepthState();
     return this.buildState(bars);
   }
 
@@ -190,7 +240,34 @@ export class FootprintAggregator {
         lastReset: this.signalStats.lastReset,
         sessionCount: { ...this.signalStats.sessionCount },
       },
+      depth: this.depthState,
     };
+  }
+
+  private applyDepthOverrides(config: SignalControlState) {
+    try {
+      const preset = MODE_PRESETS[config.mode] ?? MODE_PRESETS.conservative;
+      const overrides = config.overrides ?? {};
+      const toMs = (seconds: number | undefined, fallback: number) => {
+        const source = Number.isFinite(seconds) ? (seconds as number) : fallback;
+        return Math.max(200, Math.round(source * 1000));
+      };
+      const thresholds = {
+        absorptionWindowMs: toMs(overrides.depthAbsorptionWindowSec, preset.depthAbsorptionWindowSec),
+        absorptionMinDurationMs: toMs(overrides.depthAbsorptionMinDurationSec, preset.depthAbsorptionMinDurationSec),
+        replenishmentFactor: overrides.depthReplenishFactor ?? preset.depthReplenishFactor,
+        maxTickProgress: overrides.depthMaxTickProgress ?? preset.depthMaxTickProgress,
+        sweepTickThreshold: overrides.depthSweepTickThreshold ?? preset.depthSweepTickThreshold,
+        sweepWindowMs: toMs(overrides.depthSweepWindowSec, preset.depthSweepWindowSec),
+        sweepDeltaThreshold: overrides.depthSweepDeltaThreshold ?? preset.depthSweepDeltaThreshold,
+        sweepMinLevels: Math.max(1, Math.round(overrides.depthSweepMinLevels ?? preset.depthSweepMinLevels)),
+        spoofWindowMs: toMs(overrides.depthSpoofWindowSec, preset.depthSpoofWindowSec),
+        spoofSizeThreshold: overrides.depthSpoofSizeThreshold ?? preset.depthSpoofSizeThreshold,
+      };
+      this.depthAnalytics.updateThresholds(thresholds);
+    } catch (error) {
+      console.warn("Failed to apply depth overrides", error);
+    }
   }
 
   private serializeBars(): FootprintBar[] {
@@ -220,6 +297,10 @@ export class FootprintAggregator {
           : defaultPrice;
       const highPrice = Number.isFinite(bar.highPrice) ? bar.highPrice : Math.max(defaultPrice, closePrice);
       const lowPrice = Number.isFinite(bar.lowPrice) ? bar.lowPrice : Math.min(defaultPrice, closePrice);
+      const depthMetrics = this.depthAnalytics.getBarMetrics(bar.startTime, {
+        totalDelta: bar.totalDelta,
+      });
+      bar.depth = depthMetrics ?? bar.depth ?? null;
 
       bars.push({
         startTime: bar.startTime,
@@ -234,6 +315,7 @@ export class FootprintAggregator {
         lowPrice: Number(lowPrice.toFixed(6)),
         openPrice: Number(openPrice.toFixed(6)),
         closePrice: Number(closePrice.toFixed(6)),
+        depth: bar.depth ?? null,
       });
     }
 
@@ -252,6 +334,7 @@ export class FootprintAggregator {
     if (!this.registerTradeId(trade.tradeId)) {
       return;
     }
+    this.depthAnalytics.ingestTrade(trade);
 
     const { timeframeMs, priceStep } = this.settings;
 

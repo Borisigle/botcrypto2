@@ -88,6 +88,31 @@ export interface Trade {
   isBuyerMaker: boolean;
 }
 
+export interface DepthLevel {
+  price: number;
+  quantity: number;
+}
+
+export interface DepthSnapshot {
+  lastUpdateId: number;
+  bids: DepthLevel[];
+  asks: DepthLevel[];
+  timestamp: number;
+}
+
+export interface DepthDiff {
+  firstUpdateId: number;
+  finalUpdateId: number;
+  eventTime: number;
+  transactionTime: number;
+  bids: DepthLevel[];
+  asks: DepthLevel[];
+}
+
+export type DepthStreamMessage =
+  | { type: "snapshot"; snapshot: DepthSnapshot }
+  | { type: "diff"; diff: DepthDiff };
+
 export interface LevelBin {
   price: number;
   askVol: number;
@@ -109,12 +134,14 @@ export interface FootprintBar {
   lowPrice: number;
   openPrice: number;
   closePrice: number;
+  depth?: DepthBarMetrics | null;
 }
 
 export interface FootprintState {
   bars: FootprintBar[];
   signals: FootprintSignal[];
   signalStats: SignalStats;
+  depth: DepthState | null;
 }
 
 export type ConnectionStatus =
@@ -138,6 +165,69 @@ export interface HoverInfo {
 export type SignalStrategy = "absorption-failure" | "poc-migration" | "delta-divergence";
 
 export type SignalSide = "long" | "short";
+
+export interface DepthAbsorptionConfirmation {
+  side: SignalSide;
+  price: number;
+  startTime: number;
+  confirmedAt: number;
+  durationMs: number;
+  replenishmentFactor: number;
+  ofi: number;
+  status: "pending" | "confirmed" | "rejected";
+  tradeCount?: number;
+}
+
+export interface DepthSweepEvent {
+  direction: "up" | "down";
+  levelsCleared: number;
+  priceMoveTicks: number;
+  deltaSpike: number;
+  detectedAt: number;
+}
+
+export interface DepthSpoofingEvent {
+  side: "bid" | "ask";
+  price: number;
+  size: number;
+  addedAt: number;
+  cancelledAt: number;
+}
+
+export interface DepthBarMetrics {
+  avgOfi: number;
+  netOfi: number;
+  maxImbalance: number;
+  minImbalance: number;
+  bestBid: number | null;
+  bestAsk: number | null;
+  bestBidSize: number;
+  bestAskSize: number;
+  queueDeltaBid: number;
+  queueDeltaAsk: number;
+  maxReplenishmentBid: number;
+  maxReplenishmentAsk: number;
+  absorptions: DepthAbsorptionConfirmation[];
+  sweeps: DepthSweepEvent[];
+  spoofEvents: DepthSpoofingEvent[];
+}
+
+export interface DepthState {
+  timestamp: number;
+  bestBid: number | null;
+  bestAsk: number | null;
+  bestBidSize: number;
+  bestAskSize: number;
+  spread: number | null;
+  imbalance: number;
+  ofi: number;
+  bids: DepthLevel[];
+  asks: DepthLevel[];
+  pendingAbsorptions: DepthAbsorptionConfirmation[];
+  lastAbsorption: DepthAbsorptionConfirmation | null;
+  lastSweep: DepthSweepEvent | null;
+  lastSpoof: DepthSpoofingEvent | null;
+}
 
 export type SignalMode = "conservative" | "standard" | "aggressive";
 
@@ -188,6 +278,14 @@ export interface FootprintSignal {
   strategies: SignalStrategy[];
   levelLabel: string | null;
   evidence: SignalEvidenceItem[];
+  l2?: {
+    confirmed: boolean;
+    confidence: number;
+    reason?: string | null;
+    absorption?: DepthAbsorptionConfirmation | null;
+    sweep?: DepthSweepEvent | null;
+    spoof?: DepthSpoofingEvent | null;
+  } | null;
 }
 
 export interface SignalStats {
@@ -204,6 +302,17 @@ export interface DetectorOverrides {
   minDeltaPercentile?: number;
   minVolumePercentile?: number;
   keyLevelDistancePercent?: number;
+  requireDepthConfirmation?: boolean;
+  depthAbsorptionWindowSec?: number;
+  depthAbsorptionMinDurationSec?: number;
+  depthReplenishFactor?: number;
+  depthMaxTickProgress?: number;
+  depthSweepTickThreshold?: number;
+  depthSweepDeltaThreshold?: number;
+  depthSweepWindowSec?: number;
+  depthSweepMinLevels?: number;
+  depthSpoofWindowSec?: number;
+  depthSpoofSizeThreshold?: number;
 }
 
 export interface SignalControlState {

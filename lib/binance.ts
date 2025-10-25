@@ -1,4 +1,4 @@
-import type { ConnectionStatus, SymbolMarketConfig, Trade } from "@/types";
+import type { ConnectionStatus, DepthLevel, DepthSnapshot, SymbolMarketConfig, Trade } from "@/types";
 
 const STREAM_BASE = "wss://fstream.binance.com/stream?streams=";
 const REST_BASE = "https://fapi.binance.com/fapi/v1";
@@ -163,6 +163,14 @@ interface ExchangeInfoResponse {
   symbols?: ExchangeInfoSymbol[];
 }
 
+interface DepthSnapshotResponse {
+  lastUpdateId?: number | string;
+  E?: number | string;
+  T?: number | string;
+  bids?: Array<[string, string]>;
+  asks?: Array<[string, string]>;
+}
+
 export interface FetchAggTradesParams {
   symbol: string;
   startTime?: number;
@@ -259,6 +267,60 @@ export async function fetchSymbolMarketConfig(symbol: string): Promise<SymbolMar
     minPriceStep,
     maxPriceStep,
   };
+}
+
+export async function fetchDepthSnapshot(symbol: string, limit = 120): Promise<DepthSnapshot> {
+  ensureFetch();
+  const url = new URL(`${REST_BASE}/depth`);
+  url.searchParams.set("symbol", symbol.toUpperCase());
+  const depthLimit = Math.min(Math.max(Math.floor(limit), 5), 1000);
+  url.searchParams.set("limit", String(depthLimit));
+
+  const response = await fetch(url.toString());
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Binance depth snapshot: ${response.status}`);
+  }
+
+  const payload = (await response.json()) as DepthSnapshotResponse;
+  const lastUpdateId = safeNumber(payload.lastUpdateId);
+  if (lastUpdateId === null) {
+    throw new Error("Invalid depth snapshot response from Binance");
+  }
+
+  const bids = Array.isArray(payload.bids)
+    ? payload.bids
+        .map(mapDepthEntry)
+        .filter((level): level is DepthLevel => level !== null)
+        .slice(0, depthLimit)
+    : [];
+  const asks = Array.isArray(payload.asks)
+    ? payload.asks
+        .map(mapDepthEntry)
+        .filter((level): level is DepthLevel => level !== null)
+        .slice(0, depthLimit)
+    : [];
+
+  const timestampCandidate = safeNumber(payload.E ?? payload.T);
+  const timestamp = Number.isFinite(timestampCandidate) ? (timestampCandidate as number) : Date.now();
+
+  return {
+    lastUpdateId: Math.trunc(lastUpdateId),
+    bids,
+    asks,
+    timestamp,
+  };
+}
+
+function mapDepthEntry(entry: [string, string]): DepthLevel | null {
+  if (!Array.isArray(entry) || entry.length < 2) {
+    return null;
+  }
+  const price = safeNumber(entry[0]);
+  const quantity = safeNumber(entry[1]);
+  if (price === null || quantity === null) {
+    return null;
+  }
+  return { price, quantity };
 }
 
 function parseAggTrade(message: string): Trade | null {

@@ -10,6 +10,7 @@ import {
   fetchSymbolMarketConfig,
   type StreamStatusMeta,
 } from "@/lib/binance";
+import { BinanceDepthStream } from "@/lib/depth";
 import { AggTradeRecorder } from "@/lib/replay/recorder";
 import { AggTradeReplayer } from "@/lib/replay/replayer";
 import { computeReplayMetrics } from "@/lib/replay/summary";
@@ -18,6 +19,8 @@ import { createDefaultSignalControlState } from "@/lib/signals";
 import type {
   ConnectionDiagnostics,
   ConnectionStatus,
+  DepthState,
+  DepthStreamMessage,
   DetectorOverrides,
   FootprintBar,
   FootprintSignal,
@@ -253,6 +256,9 @@ export function useFootprint() {
   const [replayMetrics, setReplayMetrics] = useState<ReplayMetrics>({
     perMode: [],
   });
+  const [depth, setDepth] = useState<DepthState | null>(null);
+  const [depthStatus, setDepthStatus] =
+    useState<ConnectionStatus>("connecting");
 
   const priceBounds = useMemo<PriceBounds | null>(() => {
     if (!bars.length) {
@@ -310,6 +316,9 @@ export function useFootprint() {
   const tradeBufferRef = useRef<Trade[]>([]);
   const flushTimerRef = useRef<number | null>(null);
   const streamRef = useRef<BinanceAggTradeStream | null>(null);
+  const depthStreamRef = useRef<BinanceDepthStream | null>(null);
+  const depthBufferRef = useRef<DepthStreamMessage[]>([]);
+  const depthFlushTimerRef = useRef<number | null>(null);
   const lastTradeTimeRef = useRef<number | null>(null);
   const tradeIdCacheRef = useRef<TradeIdCache>(createTradeIdCache());
   const serverTimeOffsetRef = useRef(0);
@@ -378,6 +387,33 @@ export function useFootprint() {
     if (flushTimerRef.current !== null) {
       window.clearTimeout(flushTimerRef.current);
       flushTimerRef.current = null;
+    }
+  }, []);
+
+  const flushDepthUpdates = useCallback((force = false) => {
+    const worker = workerRef.current;
+    if (!worker || !workerReadyRef.current) {
+      depthBufferRef.current = [];
+      if (depthFlushTimerRef.current !== null) {
+        window.clearTimeout(depthFlushTimerRef.current);
+        depthFlushTimerRef.current = null;
+      }
+      return;
+    }
+
+    if (!depthBufferRef.current.length) {
+      if (force && depthFlushTimerRef.current !== null) {
+        window.clearTimeout(depthFlushTimerRef.current);
+        depthFlushTimerRef.current = null;
+      }
+      return;
+    }
+
+    const batch = depthBufferRef.current.splice(0);
+    worker.postMessage({ type: "depth", updates: batch });
+    if (depthFlushTimerRef.current !== null) {
+      window.clearTimeout(depthFlushTimerRef.current);
+      depthFlushTimerRef.current = null;
     }
   }, []);
 
@@ -701,6 +737,7 @@ export function useFootprint() {
         setBars(nextBars);
         setSignals(nextSignals);
         setSignalStats(normalizeSignalStats(message.state.signalStats));
+        setDepth(message.state.depth ?? null);
         setLastError(null);
         const engine = tradingEngineRef.current;
         if (engine) {
@@ -941,6 +978,58 @@ export function useFootprint() {
   ]);
 
   useEffect(() => {
+    if (typeof window === "undefined") {
+      return () => {};
+    }
+    if (mode !== "live") {
+      depthStreamRef.current?.disconnect();
+      depthStreamRef.current = null;
+      depthBufferRef.current = [];
+      setDepth(null);
+      setDepthStatus("disconnected");
+      return () => {};
+    }
+
+    const stream = new BinanceDepthStream(
+      settings.symbol,
+      {
+        onMessage: (message) => {
+          if (!workerReadyRef.current || !workerRef.current) {
+            return;
+          }
+          depthBufferRef.current.push(message);
+          if (message.type === "snapshot" || depthBufferRef.current.length >= 6) {
+            flushDepthUpdates(true);
+          } else if (depthFlushTimerRef.current === null) {
+            depthFlushTimerRef.current = window.setTimeout(() => flushDepthUpdates(true), 80);
+          }
+        },
+        onStatusChange: (status) => {
+          setDepthStatus(status);
+        },
+        onError: (message) => {
+          setLastError((prev) => prev ?? message);
+        },
+      },
+      { levels: 120, snapshotIntervalMs: 60_000 },
+    );
+
+    depthStreamRef.current = stream;
+    setDepthStatus("connecting");
+    stream.connect();
+
+    return () => {
+      stream.disconnect();
+      if (depthFlushTimerRef.current !== null) {
+        window.clearTimeout(depthFlushTimerRef.current);
+        depthFlushTimerRef.current = null;
+      }
+      depthBufferRef.current = [];
+      depthStreamRef.current = null;
+    };
+  }, [mode, settings.symbol, flushDepthUpdates]);
+
+  useEffect(() => {
     if (!workerReadyRef.current || !workerRef.current) {
       return;
     }
@@ -977,6 +1066,18 @@ export function useFootprint() {
       flushTrades(true);
     };
   }, [flushTrades]);
+
+  useEffect(() => {
+    return () => {
+      if (depthFlushTimerRef.current !== null) {
+        window.clearTimeout(depthFlushTimerRef.current);
+        depthFlushTimerRef.current = null;
+      }
+      if (depthBufferRef.current.length) {
+        flushDepthUpdates(true);
+      }
+    };
+  }, [flushDepthUpdates]);
 
   useEffect(() => {
     if (typeof window === "undefined") {

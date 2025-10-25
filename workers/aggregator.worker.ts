@@ -3,7 +3,7 @@
 import { FootprintAggregator, timeframeToMs } from "@/lib/aggregator";
 import type { AggregatorSettings } from "@/lib/aggregator";
 import { createDefaultSignalControlState } from "@/lib/signals";
-import type { FootprintState, SignalControlState, Trade } from "@/types";
+import type { DepthStreamMessage, FootprintState, SignalControlState, Trade } from "@/types";
 
 interface InitMessage {
   type: "init";
@@ -26,11 +26,16 @@ interface DetectorConfigMessage {
   config: Partial<SignalControlState>;
 }
 
+interface DepthMessage {
+  type: "depth";
+  updates: DepthStreamMessage[];
+}
+
 interface ClearMessage {
   type: "clear";
 }
 
-type WorkerMessage = InitMessage | TradesMessage | SettingsMessage | DetectorConfigMessage | ClearMessage;
+type WorkerMessage = InitMessage | TradesMessage | SettingsMessage | DetectorConfigMessage | DepthMessage | ClearMessage;
 
 type WorkerSettings = {
   timeframe: string;
@@ -101,6 +106,15 @@ ctx.onmessage = (event: MessageEvent<WorkerMessage>) => {
         } else {
           sendState(emptyState());
         }
+        break;
+      case "depth":
+        if (!aggregator) {
+          if (!currentSettings) {
+            return;
+          }
+          aggregator = createAggregator(currentSettings, detectorConfig);
+        }
+        sendState(aggregator.ingestDepth(message.updates));
         break;
       case "clear":
         aggregator?.reset();
