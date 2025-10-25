@@ -1,6 +1,6 @@
 import type { ChangeEvent } from "react";
 
-import type { TradingSettings } from "@/types";
+import type { TradingSession, TradingSettings } from "@/types";
 
 interface TradingControlsProps {
   settings: TradingSettings;
@@ -13,6 +13,22 @@ const numberOrZero = (value: string): number => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
 };
+
+const numberOrNull = (value: string): number | null => {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const SESSION_OPTIONS: Array<{ key: TradingSession; label: string }> = [
+  { key: "asia", label: "Asia" },
+  { key: "eu", label: "Europa" },
+  { key: "us", label: "EE.UU." },
+  { key: "other", label: "Otras" },
+];
 
 export function TradingControls({ settings, onSettingsChange, onResetDay, onExport }: TradingControlsProps) {
   const handleRiskChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -59,6 +75,117 @@ export function TradingControls({ settings, onSettingsChange, onResetDay, onExpo
 
   const handleAggressivenessChange = (event: ChangeEvent<HTMLSelectElement>) => {
     handleInvalidationsChange({ aggressiveness: event.target.value as TradingSettings["invalidations"]["aggressiveness"] });
+  };
+
+  const guardrails = settings.guardrails;
+  const guardrailsDisabled = !guardrails.enabled;
+
+  const handleGuardrailsChange = (partial: Partial<typeof guardrails>) => {
+    onSettingsChange({
+      guardrails: {
+        ...guardrails,
+        ...partial,
+      },
+    });
+  };
+
+  const handleGuardrailsToggle = (event: ChangeEvent<HTMLInputElement>) => {
+    handleGuardrailsChange({ enabled: event.target.checked });
+  };
+
+  const handleMaxDailyLossChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const value = numberOrNull(event.target.value);
+    handleGuardrailsChange({ maxDailyLossR: value !== null && value > 0 ? value : null });
+  };
+
+  const handleMaxTradesPerDayChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const value = numberOrNull(event.target.value);
+    handleGuardrailsChange({ maxTradesPerDay: value !== null && value > 0 ? Math.floor(value) : null });
+  };
+
+  const handleMaxConsecutiveLossesChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const value = numberOrNull(event.target.value);
+    handleGuardrailsChange({ maxConsecutiveLosses: value !== null && value > 0 ? Math.floor(value) : null });
+  };
+
+  const handleLossCooldownTriggerChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const value = Math.max(0, Math.floor(numberOrZero(event.target.value)));
+    handleGuardrailsChange({ lossCooldownTrigger: value });
+  };
+
+  const handleLossCooldownMinutesChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const value = Math.max(0, Math.floor(numberOrZero(event.target.value)));
+    handleGuardrailsChange({ lossCooldownMinutes: value });
+  };
+
+  const handleDailyStopCooldownChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const value = Math.max(0, Math.floor(numberOrZero(event.target.value)));
+    handleGuardrailsChange({ dailyStopCooldownMinutes: value });
+  };
+
+  const handleSessionMaxTradesChange = (session: TradingSession, event: ChangeEvent<HTMLInputElement>) => {
+    const value = numberOrNull(event.target.value);
+    const normalized = value !== null && value > 0 ? Math.floor(value) : null;
+    handleGuardrailsChange({
+      perSessionMaxTrades: {
+        ...(guardrails.perSessionMaxTrades ?? {}),
+        [session]: normalized,
+      },
+    });
+  };
+
+  const handleSessionMaxLossChange = (session: TradingSession, event: ChangeEvent<HTMLInputElement>) => {
+    const value = numberOrNull(event.target.value);
+    const normalized = value !== null && value > 0 ? value : null;
+    handleGuardrailsChange({
+      perSessionMaxLossR: {
+        ...(guardrails.perSessionMaxLossR ?? {}),
+        [session]: normalized,
+      },
+    });
+  };
+
+  const handleAllowedSessionToggle = (session: TradingSession, checked: boolean) => {
+    if (checked) {
+      const next = Array.from(new Set([...guardrails.allowedSessions, session]));
+      handleGuardrailsChange({ allowedSessions: next });
+    } else {
+      handleGuardrailsChange({
+        allowedSessions: guardrails.allowedSessions.filter((item) => item !== session),
+      });
+    }
+  };
+
+  const newsInputValue = guardrails.newsWindows
+    .map((window) =>
+      window.label ? `${window.start}|${window.end}|${window.label}` : `${window.start}|${window.end}`,
+    )
+    .join("\n");
+
+  const handleNewsWindowsChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
+    const lines = event.target.value.split("\n");
+    const windows: typeof guardrails.newsWindows = [];
+    const timestamp = Date.now();
+    let index = 0;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      const [startRaw, endRaw, labelRaw] = trimmed.split("|").map((part) => part.trim());
+      if (!startRaw || !endRaw) {
+        continue;
+      }
+      const base = guardrails.newsWindows[index];
+      windows.push({
+        id: base?.id ?? `manual-${timestamp}-${index}`,
+        start: startRaw,
+        end: endRaw,
+        label: labelRaw ?? "",
+      });
+      index += 1;
+    }
+    handleGuardrailsChange({ newsWindows: windows });
   };
 
   return (
@@ -233,8 +360,155 @@ export function TradingControls({ settings, onSettingsChange, onResetDay, onExpo
         </div>
       </div>
 
+      <div className="rounded-md border border-white/10 bg-black/30 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-[11px] font-semibold uppercase tracking-wide text-white/70">Guardrails de riesgo</h3>
+          <label className="flex items-center gap-2 text-[11px] text-white/70">
+            Activo
+            <input
+              type="checkbox"
+              className="h-4 w-4 accent-emerald-500"
+              checked={guardrails.enabled}
+              onChange={handleGuardrailsToggle}
+            />
+          </label>
+        </div>
+        <p className="mt-2 text-[11px] text-slate-400">Límites diarios y cooldowns. 0 o vacío desactivan cada parámetro.</p>
+        <div className="mt-3 grid gap-3 md:grid-cols-3">
+          <LabeledNumber
+            label="Pérdida diaria máx (R)"
+            value={guardrails.maxDailyLossR ?? 0}
+            step={0.1}
+            min={0}
+            onChange={handleMaxDailyLossChange}
+            disabled={guardrailsDisabled}
+          />
+          <LabeledNumber
+            label="Trades diarios máx"
+            value={guardrails.maxTradesPerDay ?? 0}
+            step={1}
+            min={0}
+            onChange={handleMaxTradesPerDayChange}
+            disabled={guardrailsDisabled}
+          />
+          <LabeledNumber
+            label="Pérdidas consecutivas máx"
+            value={guardrails.maxConsecutiveLosses ?? 0}
+            step={1}
+            min={0}
+            onChange={handleMaxConsecutiveLossesChange}
+            disabled={guardrailsDisabled}
+          />
+        </div>
+        <div className="mt-3 grid gap-3 md:grid-cols-3">
+          <LabeledNumber
+            label="Cooldown tras pérdidas (n)"
+            value={guardrails.lossCooldownTrigger}
+            step={1}
+            min={0}
+            onChange={handleLossCooldownTriggerChange}
+            disabled={guardrailsDisabled}
+          />
+          <LabeledNumber
+            label="Cooldown pérdidas (min)"
+            value={guardrails.lossCooldownMinutes}
+            step={5}
+            min={0}
+            onChange={handleLossCooldownMinutesChange}
+            disabled={guardrailsDisabled}
+          />
+          <LabeledNumber
+            label="Cooldown daily stop (min)"
+            value={guardrails.dailyStopCooldownMinutes}
+            step={15}
+            min={0}
+            onChange={handleDailyStopCooldownChange}
+            disabled={guardrailsDisabled}
+          />
+        </div>
+        <div className="mt-4 grid gap-4 md:grid-cols-2">
+          <div>
+            <h4 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Límites por sesión (trades)</h4>
+            <div className="mt-2 grid gap-2">
+              {SESSION_OPTIONS.map((option) => (
+                <label
+                  key={`session-trades-${option.key}`}
+                  className="flex items-center justify-between gap-3 text-xs text-white/70"
+                >
+                  <span>{option.label}</span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={guardrails.perSessionMaxTrades?.[option.key] ?? ""}
+                    onChange={(event) => handleSessionMaxTradesChange(option.key, event)}
+                    disabled={guardrailsDisabled}
+                    className="w-24 rounded-md border border-white/10 bg-black/40 px-2 py-1 text-xs text-white focus:border-emerald-400 focus:outline-none"
+                  />
+                </label>
+              ))}
+            </div>
+          </div>
+          <div>
+            <h4 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Límites por sesión (pérdida R)</h4>
+            <div className="mt-2 grid gap-2">
+              {SESSION_OPTIONS.map((option) => (
+                <label
+                  key={`session-loss-${option.key}`}
+                  className="flex items-center justify-between gap-3 text-xs text-white/70"
+                >
+                  <span>{option.label}</span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.1}
+                    value={guardrails.perSessionMaxLossR?.[option.key] ?? ""}
+                    onChange={(event) => handleSessionMaxLossChange(option.key, event)}
+                    disabled={guardrailsDisabled}
+                    className="w-24 rounded-md border border-white/10 bg-black/40 px-2 py-1 text-xs text-white focus:border-emerald-400 focus:outline-none"
+                  />
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="mt-4">
+          <h4 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Sesiones permitidas</h4>
+          <div className="mt-2 flex flex-wrap gap-3">
+            {SESSION_OPTIONS.map((option) => {
+              const checked = guardrails.allowedSessions.includes(option.key);
+              return (
+                <label key={`session-allow-${option.key}`} className="flex items-center gap-2 text-xs text-white/70">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-emerald-500"
+                    checked={checked}
+                    onChange={(event) => handleAllowedSessionToggle(option.key, event.target.checked)}
+                    disabled={guardrailsDisabled}
+                  />
+                  {option.label}
+                </label>
+              );
+            })}
+          </div>
+          <p className="mt-1 text-[11px] text-slate-500">Sin selección: todas las sesiones permitidas.</p>
+        </div>
+        <div className="mt-4">
+          <h4 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Ventanas de noticias</h4>
+          <textarea
+            rows={3}
+            className="mt-2 w-full rounded-md border border-white/10 bg-black/40 px-3 py-2 text-xs text-white focus:border-emerald-400 focus:outline-none"
+            placeholder="2024-10-25T12:30:00Z|2024-10-25T13:00:00Z|Evento"
+            value={newsInputValue}
+            onChange={handleNewsWindowsChange}
+            disabled={guardrailsDisabled}
+          />
+          <p className="mt-1 text-[11px] text-slate-500">Formato: inicio|fin|etiqueta opcional (UTC).</p>
+        </div>
+      </div>
+
       <div className="flex flex-wrap gap-3">
-        <button
+
           type="button"
           className="flex-1 rounded-md border border-emerald-400 bg-emerald-500/20 px-3 py-2 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30"
           onClick={() => onExport("json")}
@@ -266,10 +540,11 @@ interface LabeledNumberProps {
   step?: number;
   min?: number;
   max?: number;
+  disabled?: boolean;
   onChange: (event: ChangeEvent<HTMLInputElement>) => void;
 }
 
-function LabeledNumber({ label, value, step = 0.1, min, max, onChange }: LabeledNumberProps) {
+function LabeledNumber({ label, value, step = 0.1, min, max, disabled, onChange }: LabeledNumberProps) {
   return (
     <label className="flex flex-col gap-1 text-xs text-white/70">
       <span className="font-semibold text-white/80">{label}</span>
@@ -280,7 +555,8 @@ function LabeledNumber({ label, value, step = 0.1, min, max, onChange }: Labeled
         min={min}
         max={max}
         onChange={onChange}
-        className="rounded-md border border-white/10 bg-black/40 px-3 py-2 text-xs text-white focus:border-emerald-400 focus:outline-none"
+        disabled={disabled}
+        className="rounded-md border border-white/10 bg-black/40 px-3 py-2 text-xs text-white focus:border-emerald-400 focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
       />
     </label>
   );

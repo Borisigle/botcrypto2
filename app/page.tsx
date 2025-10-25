@@ -173,6 +173,7 @@ export default function Page() {
         priceStep={settings.priceStep}
         barsCount={bars.length}
         diagnostics={connectionDiagnostics}
+        guardrails={tradingState.guardrails}
         lastError={lastError}
       />
     </main>

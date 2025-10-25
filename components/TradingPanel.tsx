@@ -1,7 +1,14 @@
 import { useMemo } from "react";
 
 import { InvalidationPanel } from "@/components/InvalidationPanel";
-import type { FootprintSignal, InvalidationActionType, PendingTrade, Position, TradingState } from "@/types";
+import type {
+  FootprintSignal,
+  InvalidationActionType,
+  PendingTrade,
+  Position,
+  TradingState,
+  RiskGuardrailStatus,
+} from "@/types";
 
 interface TradingPanelProps {
   signals: FootprintSignal[];
@@ -22,7 +29,7 @@ export function TradingPanel({
   onFlattenPosition,
   onInvalidationAction,
 }: TradingPanelProps) {
-  const { pending, positions, closed, settings, daily } = tradingState;
+  const { pending, positions, closed, settings, daily, guardrails } = tradingState;
   const retestWindowMs = Math.max(0, settings.retestWindowMinutes) * 60_000;
   const now = Date.now() + clockOffsetMs;
 
@@ -54,6 +61,7 @@ export function TradingPanel({
         signals={availableSignals}
         onTakeSignal={onTakeSignal}
         retestWindowMs={retestWindowMs}
+        guardrails={guardrails}
       />
       <div className="grid gap-4 lg:grid-cols-2">
         <PendingCard pending={sortedPending} onCancelPending={onCancelPending} now={now} />
@@ -62,6 +70,7 @@ export function TradingPanel({
       <InvalidationPanel events={sortedInvalidations} onAction={onInvalidationAction} />
       <ClosedTradesCard trades={recentClosed} />
       <DailySummaryCard daily={daily} riskPercent={settings.riskPerTradePercent} />
+      <GuardrailLogCard guardrails={guardrails} />
     </section>
   );
 }
@@ -70,9 +79,32 @@ interface SignalsCardProps {
   signals: FootprintSignal[];
   onTakeSignal: (signalId: string) => void;
   retestWindowMs: number;
+  guardrails: TradingState["guardrails"];
 }
 
-function SignalsCard({ signals, onTakeSignal, retestWindowMs }: SignalsCardProps) {
+function SignalsCard({ signals, onTakeSignal, retestWindowMs, guardrails }: SignalsCardProps) {
+  const guardrailBlocks = guardrails.activeBlocks;
+  const guardrailMeta = getGuardrailMeta(guardrails.status);
+  const guardrailBannerBlock =
+    guardrails.status !== "ok"
+      ? guardrailBlocks[0] ?? guardrails.lastBlock ?? null
+      : null;
+
+  const findBlockingBlock = (signal: FootprintSignal) => {
+    for (const block of guardrailBlocks) {
+      if (!block.session) {
+        return block;
+      }
+      if (block.session === signal.session) {
+        return block;
+      }
+    }
+    if (guardrails.status === "locked" || guardrails.status === "cooldown") {
+      return guardrailBlocks[0] ?? guardrails.lastBlock ?? null;
+    }
+    return undefined;
+  };
+
   return (
     <article className="rounded-lg border border-white/10 bg-white/5 p-4 shadow-inner shadow-black/20">
       <header className="flex items-center justify-between">
@@ -81,32 +113,56 @@ function SignalsCard({ signals, onTakeSignal, retestWindowMs }: SignalsCardProps
           <p className="text-xs text-slate-400">Ventana de retest: {Math.round(retestWindowMs / 60_000)} min</p>
         </div>
       </header>
+      {guardrailBannerBlock ? (
+        <div
+          className={`mt-3 rounded-md border px-3 py-2 text-[11px] ${guardrailMeta.bannerClass}`}
+        >
+          <span className="font-semibold uppercase tracking-wide">{guardrailMeta.label}</span>
+          <span className="ml-2">{guardrailBannerBlock.reason}</span>
+        </div>
+      ) : null}
       {signals.length ? (
         <ul className="mt-3 flex flex-col gap-2">
-          {signals.map((signal) => (
-            <li
-              key={signal.id}
-              className="flex flex-col gap-1 rounded-md border border-white/10 bg-black/40 p-3 text-xs text-white/80 md:flex-row md:items-center md:justify-between"
-            >
-              <div className="flex flex-wrap items-center gap-3">
-                <span className={`font-semibold uppercase ${signal.side === "long" ? "text-emerald-300" : "text-rose-300"}`}>
-                  {signal.side === "long" ? "Long" : "Short"}
-                </span>
-                <span className="text-slate-300">{formatStrategy(signal.strategy)}</span>
-                <span className="text-slate-400">{new Date(signal.timestamp).toLocaleTimeString()}</span>
-                <span className="font-mono text-xs text-white/90">E: {signal.entry.toFixed(2)}</span>
-                <span className="font-mono text-xs text-white/60">SL: {signal.stop.toFixed(2)}</span>
-                <span className="font-mono text-xs text-white/60">T1: {signal.target1.toFixed(2)}</span>
-              </div>
-              <button
-                type="button"
-                className="mt-2 w-full rounded-md border border-emerald-400 bg-emerald-500/20 px-3 py-1.5 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30 md:mt-0 md:w-auto"
-                onClick={() => onTakeSignal(signal.id)}
+          {signals.map((signal) => {
+            const blockingBlock = findBlockingBlock(signal);
+            const blocked = Boolean(blockingBlock);
+            const buttonClass = blocked
+              ? "mt-2 w-full rounded-md border border-emerald-400/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-200/60 transition disabled:cursor-not-allowed disabled:opacity-60 md:mt-0 md:w-auto"
+              : "mt-2 w-full rounded-md border border-emerald-400 bg-emerald-500/20 px-3 py-1.5 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30 md:mt-0 md:w-auto";
+            return (
+              <li
+                key={signal.id}
+                className="flex flex-col gap-1 rounded-md border border-white/10 bg-black/40 p-3 text-xs text-white/80 md:flex-row md:items-center md:justify-between"
               >
-                Tomar señal
-              </button>
-            </li>
-          ))}
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className={`font-semibold uppercase ${signal.side === "long" ? "text-emerald-300" : "text-rose-300"}`}>
+                    {signal.side === "long" ? "Long" : "Short"}
+                  </span>
+                  <span className="text-slate-300">{formatStrategy(signal.strategy)}</span>
+                  <span className="text-slate-400">{new Date(signal.timestamp).toLocaleTimeString()}</span>
+                  <span className="font-mono text-xs text-white/90">E: {signal.entry.toFixed(2)}</span>
+                  <span className="font-mono text-xs text-white/60">SL: {signal.stop.toFixed(2)}</span>
+                  <span className="font-mono text-xs text-white/60">T1: {signal.target1.toFixed(2)}</span>
+                </div>
+                <div className="md:mt-0 md:w-auto">
+                  <button
+                    type="button"
+                    className={buttonClass}
+                    onClick={() => onTakeSignal(signal.id)}
+                    disabled={blocked}
+                    title={blockingBlock?.reason}
+                  >
+                    Tomar señal
+                  </button>
+                  {blocked ? (
+                    <p className="mt-1 text-[11px] text-rose-300">
+                      {blockingBlock?.reason ?? "Guardrail activo"}
+                    </p>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
         </ul>
       ) : (
         <p className="mt-3 rounded-md border border-dashed border-white/10 bg-black/30 px-3 py-2 text-xs text-slate-400">
@@ -316,6 +372,90 @@ function DailySummaryCard({ daily, riskPercent }: DailySummaryCardProps) {
       </div>
     </article>
   );
+}
+
+interface GuardrailLogCardProps {
+  guardrails: TradingState["guardrails"];
+}
+
+function GuardrailLogCard({ guardrails }: GuardrailLogCardProps) {
+  const logs = guardrails.logs.slice(-6).reverse();
+  const meta = getGuardrailMeta(guardrails.status);
+  const hasActiveBlocks = guardrails.activeBlocks.length > 0;
+
+  if (!hasActiveBlocks && !logs.length && guardrails.status === "ok") {
+    return null;
+  }
+
+  return (
+    <article className="rounded-lg border border-white/10 bg-white/5 p-4 shadow-inner shadow-black/20">
+      <header className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-white/80">Guardrails</h3>
+        <span className={`text-xs font-semibold ${meta.textClass}`}>{meta.label}</span>
+      </header>
+      {hasActiveBlocks ? (
+        <ul className="mt-3 space-y-1 text-xs text-white/80">
+          {guardrails.activeBlocks.slice(0, 3).map((block) => (
+            <li key={`${block.source}-${block.session ?? "all"}-${block.until ?? "permanent"}`} className="flex items-center justify-between gap-2">
+              <span>{block.reason}</span>
+              {block.until ? (
+                <span className="font-mono text-[10px] text-slate-500">{formatGuardrailUntil(block.until)}</span>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="mt-3 text-[11px] text-slate-500">Sin bloqueos activos.</p>
+      )}
+      {logs.length ? (
+        <div className="mt-3">
+          <h4 className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Actividad reciente</h4>
+          <ul className="mt-1 space-y-1 text-[11px] text-slate-300">
+            {logs.map((log) => (
+              <li key={`${log.timestamp}-${log.source}-${log.message}`} className="flex items-center justify-between gap-2">
+                <span>{log.message}</span>
+                <span className="font-mono text-[10px] text-slate-500">
+                  {new Date(log.timestamp).toLocaleTimeString()}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+const GUARDRAIL_META: Record<RiskGuardrailStatus, { label: string; textClass: string; bannerClass: string }> = {
+  ok: {
+    label: "OK",
+    textClass: "text-emerald-200",
+    bannerClass: "border-emerald-400/40 bg-emerald-500/10 text-emerald-200",
+  },
+  limited: {
+    label: "Limitado",
+    textClass: "text-sky-200",
+    bannerClass: "border-sky-400/40 bg-sky-500/10 text-sky-200",
+  },
+  cooldown: {
+    label: "Cooldown",
+    textClass: "text-amber-200",
+    bannerClass: "border-amber-400/40 bg-amber-500/10 text-amber-200",
+  },
+  locked: {
+    label: "Bloqueado",
+    textClass: "text-rose-300",
+    bannerClass: "border-rose-400/40 bg-rose-500/10 text-rose-300",
+  },
+};
+
+function getGuardrailMeta(status: RiskGuardrailStatus) {
+  return GUARDRAIL_META[status];
+}
+
+function formatGuardrailUntil(until: number): string {
+  const date = new Date(until);
+  return date.toISOString().slice(11, 16);
 }
 
 interface SummaryStatProps {
