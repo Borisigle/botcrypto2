@@ -310,7 +310,10 @@ export type InvalidationTriggerId =
   | "cumdelta-break"
   | "key-level-recapture"
   | "time-decay"
-  | "liquidity-sweep";
+  | "liquidity-sweep"
+  | "objective-prints"
+  | "objective-depth"
+  | "objective-time-decay";
 
 export type InvalidationSeverity = "low" | "medium" | "high";
 
@@ -410,6 +413,59 @@ export interface InvalidationSettings {
   keyLevelDeltaThreshold: number;
 }
 
+export interface ObjectiveInvalidationSettings {
+  enabled: boolean;
+  persistenceSeconds: number;
+  persistenceBars: number;
+  gracePeriodSeconds: number;
+  hysteresisPoints: number;
+  printsThreshold: number;
+  depthThreshold: number;
+  printsWeight: number;
+  depthWeight: number;
+  severeThreshold: number;
+  highThreshold: number;
+  mediumThreshold: number;
+  winnerProtectMfeR: number;
+  winnerProtectTp1DistanceR: number;
+  winnerProtectDepthThreshold: number;
+  severeSweepLevels: number;
+  severeSweepWindowMs: number;
+  severeSweepMinTicks: number;
+  severeSweepDeltaPercentile: number;
+  timeDecayMinutes: number;
+  timeDecayMinMfe: number;
+  timeDecayContraBars: number;
+  timeDecayDeltaThreshold: number;
+  timeDecayOfiThreshold: number;
+  autoCloseSevere: boolean;
+}
+
+export interface ObjectiveInvalidationBreakdown {
+  printsScore: number;
+  depthScore: number;
+  persistenceSeconds: number;
+  reasons: string[];
+  timeDecayEscalated: boolean;
+  winnerProtected: boolean;
+}
+
+export interface ObjectiveInvalidationKpiBucket {
+  events: number;
+  falsePositives: number;
+  falsePositiveRate: number;
+  stopsAvoided: number;
+  savedR: number;
+  expectancyDelta: number;
+}
+
+export interface ObjectiveInvalidationKpis {
+  day: string;
+  total: ObjectiveInvalidationKpiBucket;
+  perSession: Record<TradingSession, ObjectiveInvalidationKpiBucket>;
+  perStrategy: Record<SignalStrategy, ObjectiveInvalidationKpiBucket>;
+}
+
 export interface InvalidationEvent {
   id: string;
   positionId: string;
@@ -418,6 +474,8 @@ export interface InvalidationEvent {
   triggerId: InvalidationTriggerId;
   triggerLabel: string;
   triggers: Array<{ id: InvalidationTriggerId; severity: number }>;
+  policy: "legacy" | "objective";
+  breakdown?: ObjectiveInvalidationBreakdown;
   score: number;
   severity: InvalidationSeverity;
   evidence: InvalidationEvidenceItem[];
@@ -447,6 +505,7 @@ export interface TradingSettings {
   beOffsetTicks: number;
   invalidationBars: number;
   invalidations: InvalidationSettings;
+  objectiveInvalidation: ObjectiveInvalidationSettings;
   guardrails: RiskGuardrailSettings;
 }
 
@@ -574,6 +633,7 @@ export interface TradingState {
   invalidations: InvalidationEvent[];
   timeline: TradingTimelineEntry[];
   guardrails: RiskGuardrailState;
+  kpis: ObjectiveInvalidationKpis;
   version: number;
 }
 
