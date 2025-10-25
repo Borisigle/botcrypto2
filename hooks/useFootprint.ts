@@ -1,4 +1,4 @@
-'use client';
+"use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -10,6 +10,9 @@ import {
   fetchSymbolMarketConfig,
   type StreamStatusMeta,
 } from "@/lib/binance";
+import { AggTradeRecorder } from "@/lib/replay/recorder";
+import { AggTradeReplayer } from "@/lib/replay/replayer";
+import { computeReplayMetrics } from "@/lib/replay/summary";
 import { TradingEngine, DEFAULT_TRADING_SETTINGS } from "@/lib/trading/engine";
 import { createDefaultSignalControlState } from "@/lib/signals";
 import type {
@@ -19,7 +22,12 @@ import type {
   FootprintBar,
   FootprintSignal,
   FootprintState,
+  FootprintMode,
   InvalidationActionType,
+  RecordingDatasetSummary,
+  ReplayMetrics,
+  ReplaySpeed,
+  ReplayState,
   Settings,
   SignalControlState,
   SignalMode,
@@ -84,6 +92,17 @@ const EMPTY_SIGNAL_STATS: SignalStats = {
     us: 0,
     other: 0,
   },
+};
+
+const INITIAL_REPLAY_STATE: ReplayState = {
+  datasetId: null,
+  speed: 1,
+  status: "idle",
+  progress: 0,
+  error: null,
+  durationMs: null,
+  startedAt: null,
+  completedAt: null,
 };
 
 interface PriceBounds {
@@ -190,7 +209,8 @@ function normalizeSignalStats(stats?: SignalStats): SignalStats {
 function normalizePriceStep(step: number, config: SymbolMarketConfig): number {
   const tick = config.tickSize > 0 ? config.tickSize : 0.1;
   const min = config.minPriceStep > 0 ? config.minPriceStep : tick;
-  const maxBase = config.maxPriceStep > min ? config.maxPriceStep : Math.max(min, tick * 40);
+  const maxBase =
+    config.maxPriceStep > min ? config.maxPriceStep : Math.max(min, tick * 40);
   if (!Number.isFinite(step) || step <= 0) {
     return Number(min.toFixed(8));
   }
@@ -204,18 +224,35 @@ export function useFootprint() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [bars, setBars] = useState<FootprintBar[]>([]);
   const [signals, setSignals] = useState<FootprintSignal[]>([]);
-  const [signalStats, setSignalStats] = useState<SignalStats>(() => normalizeSignalStats());
+  const [signalStats, setSignalStats] = useState<SignalStats>(() =>
+    normalizeSignalStats(),
+  );
   const [signalControl, setSignalControl] = useState<SignalControlState>(() =>
     createDefaultSignalControlState(),
   );
-  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
+  const [connectionStatus, setConnectionStatus] =
+    useState<ConnectionStatus>("connecting");
   const [lastError, setLastError] = useState<string | null>(null);
-  const [tradingState, setTradingState] = useState<TradingState>(DEFAULT_TRADING_STATE);
-  const [connectionDiagnostics, setConnectionDiagnostics] = useState<ConnectionDiagnostics>(
-    INITIAL_DIAGNOSTICS,
+  const [tradingState, setTradingState] = useState<TradingState>(
+    DEFAULT_TRADING_STATE,
   );
+  const [connectionDiagnostics, setConnectionDiagnostics] =
+    useState<ConnectionDiagnostics>(INITIAL_DIAGNOSTICS);
   const [serverTimeOffsetMs, setServerTimeOffsetMs] = useState(0);
-  const [marketConfig, setMarketConfig] = useState<SymbolMarketConfig>(INITIAL_MARKET_CONFIG);
+  const [marketConfig, setMarketConfig] = useState<SymbolMarketConfig>(
+    INITIAL_MARKET_CONFIG,
+  );
+  const [mode, setMode] = useState<FootprintMode>("live");
+  const [recordingDataset, setRecordingDataset] =
+    useState<RecordingDatasetSummary | null>(null);
+  const [availableDatasets, setAvailableDatasets] = useState<
+    RecordingDatasetSummary[]
+  >([]);
+  const [replayState, setReplayState] =
+    useState<ReplayState>(INITIAL_REPLAY_STATE);
+  const [replayMetrics, setReplayMetrics] = useState<ReplayMetrics>({
+    perMode: [],
+  });
 
   const priceBounds = useMemo<PriceBounds | null>(() => {
     if (!bars.length) {
@@ -256,8 +293,18 @@ export function useFootprint() {
     [marketConfig],
   );
 
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
+  useEffect(() => {
+    replayStateRef.current = replayState;
+  }, [replayState]);
+
   const signalControlRef = useRef<SignalControlState>(signalControl);
   const tradingEngineRef = useRef<TradingEngine | null>(null);
+  const liveEngineRef = useRef<TradingEngine | null>(null);
+  const liveSettingsRef = useRef<Settings | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const workerReadyRef = useRef(false);
   const tradeBufferRef = useRef<Trade[]>([]);
@@ -273,6 +320,17 @@ export function useFootprint() {
   const wasEverConnectedRef = useRef(false);
   const reconnectAttemptsRef = useRef(0);
   const marketConfigRef = useRef<SymbolMarketConfig>(INITIAL_MARKET_CONFIG);
+  const recorderRef = useRef<AggTradeRecorder | null>(null);
+  const recorderReadyRef = useRef(false);
+  const recorderContextRef = useRef<{
+    symbol: string;
+    timeframe: Timeframe;
+    priceStep: number;
+  } | null>(null);
+  const replayerRef = useRef<AggTradeReplayer | null>(null);
+  const modeRef = useRef<FootprintMode>("live");
+  const replayStateRef = useRef<ReplayState>(INITIAL_REPLAY_STATE);
+  const datasetMetricsCacheRef = useRef<Map<string, ReplayMetrics>>(new Map());
 
   const syncServerTime = useCallback(async () => {
     try {
@@ -289,34 +347,48 @@ export function useFootprint() {
     }
   }, []);
 
-  const flushTrades = useCallback(
-    (force = false) => {
-      const worker = workerRef.current;
-      if (!worker || !workerReadyRef.current) {
-        return;
-      }
+  const refreshDatasets = useCallback(async () => {
+    if (!recorderRef.current) {
+      return;
+    }
+    try {
+      const list = await recorderRef.current.listDatasets();
+      setAvailableDatasets(list);
+    } catch (error) {
+      console.warn("Failed to refresh replay datasets", error);
+    }
+  }, []);
 
-      const buffer = tradeBufferRef.current;
-      if (!buffer.length) {
-        return;
-      }
+  const flushTrades = useCallback((force = false) => {
+    const worker = workerRef.current;
+    if (!worker || !workerReadyRef.current) {
+      return;
+    }
 
-      if (!force && buffer.length < 50 && flushTimerRef.current !== null) {
-        return;
-      }
+    const buffer = tradeBufferRef.current;
+    if (!buffer.length) {
+      return;
+    }
 
-      worker.postMessage({ type: "trades", trades: buffer.splice(0) });
-      if (flushTimerRef.current !== null) {
-        window.clearTimeout(flushTimerRef.current);
-        flushTimerRef.current = null;
-      }
-    },
-    [],
-  );
+    if (!force && buffer.length < 50 && flushTimerRef.current !== null) {
+      return;
+    }
+
+    worker.postMessage({ type: "trades", trades: buffer.splice(0) });
+    if (flushTimerRef.current !== null) {
+      window.clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+  }, []);
 
   const pushTrade = useCallback(
     (trade: Trade) => {
       tradeBufferRef.current.push(trade);
+      if (modeRef.current === "live" && recorderRef.current) {
+        recorderRef.current.record(trade).catch((error) => {
+          console.warn("Failed to record trade", error);
+        });
+      }
       const engine = tradingEngineRef.current;
       if (engine) {
         const updated = engine.handleTrade(trade);
@@ -363,7 +435,10 @@ export function useFootprint() {
       const serverNow = Date.now() + serverOffset;
       const fallbackStart = serverNow - BACKFILL_LOOKBACK_MS;
       const lastProcessed = lastTradeTimeRef.current ?? fallbackStart;
-      const startTime = Math.max(0, Math.min(lastProcessed, serverNow) - BACKFILL_LOOKBACK_MS);
+      const startTime = Math.max(
+        0,
+        Math.min(lastProcessed, serverNow) - BACKFILL_LOOKBACK_MS,
+      );
       const endTime = Math.max(serverNow, startTime + 1);
 
       let collected: Trade[] = [];
@@ -397,13 +472,18 @@ export function useFootprint() {
         nextFromId = last.tradeId + 1;
       }
 
-      collected.sort((a, b) => (a.timestamp - b.timestamp) || (a.tradeId - b.tradeId));
+      collected.sort(
+        (a, b) => a.timestamp - b.timestamp || a.tradeId - b.tradeId,
+      );
 
       const fresh: Trade[] = [];
       for (const trade of collected) {
         if (registerTradeId(tradeIdCacheRef.current, trade.tradeId)) {
           fresh.push(trade);
-          lastTradeTimeRef.current = Math.max(lastTradeTimeRef.current ?? 0, trade.timestamp);
+          lastTradeTimeRef.current = Math.max(
+            lastTradeTimeRef.current ?? 0,
+            trade.timestamp,
+          );
         }
       }
 
@@ -439,7 +519,10 @@ export function useFootprint() {
 
   const processIncomingTrade = useCallback(
     (trade: Trade) => {
-      lastTradeTimeRef.current = Math.max(lastTradeTimeRef.current ?? 0, trade.timestamp);
+      lastTradeTimeRef.current = Math.max(
+        lastTradeTimeRef.current ?? 0,
+        trade.timestamp,
+      );
       if (!registerTradeId(tradeIdCacheRef.current, trade.tradeId)) {
         return;
       }
@@ -453,6 +536,110 @@ export function useFootprint() {
     },
     [pushTrade],
   );
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    let cancelled = false;
+    const recorder = new AggTradeRecorder(undefined, {
+      onDatasetUpdate: (dataset) => {
+        if (cancelled) {
+          return;
+        }
+        setRecordingDataset(dataset);
+        void refreshDatasets();
+      },
+    });
+    recorderRef.current = recorder;
+
+    recorder
+      .start({
+        symbol: DEFAULT_SETTINGS.symbol,
+        timeframe: DEFAULT_SETTINGS.timeframe,
+        priceStep: DEFAULT_SETTINGS.priceStep,
+      })
+      .then((dataset) => {
+        if (cancelled) {
+          return;
+        }
+        recorderReadyRef.current = true;
+        recorderContextRef.current = {
+          symbol: dataset.symbol,
+          timeframe: dataset.timeframe,
+          priceStep: dataset.priceStep,
+        };
+        setRecordingDataset(dataset);
+        void refreshDatasets();
+      })
+      .catch((error) => {
+        console.warn("Failed to start trade recorder", error);
+      });
+
+    return () => {
+      cancelled = true;
+      recorderRef.current = null;
+      recorder.stop().catch((error) => {
+        console.warn("Failed to stop recorder", error);
+      });
+    };
+  }, [refreshDatasets]);
+
+  useEffect(() => {
+    if (!recorderReadyRef.current) {
+      return;
+    }
+    if (mode !== "live") {
+      return;
+    }
+    const context = recorderContextRef.current;
+    const symbolChanged = !context || context.symbol !== settings.symbol;
+    const timeframeChanged =
+      !context || context.timeframe !== settings.timeframe;
+    const priceStepChanged =
+      !context || Math.abs(context.priceStep - settings.priceStep) > 1e-8;
+
+    if (!symbolChanged && !timeframeChanged && !priceStepChanged) {
+      return;
+    }
+
+    const recorder = recorderRef.current;
+    if (!recorder) {
+      return;
+    }
+    let cancelled = false;
+    recorder
+      .rotate({
+        symbol: settings.symbol,
+        timeframe: settings.timeframe,
+        priceStep: settings.priceStep,
+      })
+      .then((dataset) => {
+        if (cancelled) {
+          return;
+        }
+        recorderContextRef.current = {
+          symbol: dataset.symbol,
+          timeframe: dataset.timeframe,
+          priceStep: dataset.priceStep,
+        };
+        setRecordingDataset(dataset);
+        void refreshDatasets();
+      })
+      .catch((error) => {
+        console.warn("Failed to rotate recorder dataset", error);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    mode,
+    settings.symbol,
+    settings.timeframe,
+    settings.priceStep,
+    refreshDatasets,
+  ]);
 
   const handleStatusChange = useCallback(
     (status: ConnectionStatus, meta?: StreamStatusMeta) => {
@@ -496,12 +683,17 @@ export function useFootprint() {
       return;
     }
 
-    const worker = new Worker(new URL("../workers/aggregator.worker.ts", import.meta.url), {
-      type: "module",
-    });
+    const worker = new Worker(
+      new URL("../workers/aggregator.worker.ts", import.meta.url),
+      {
+        type: "module",
+      },
+    );
     workerRef.current = worker;
 
-    worker.onmessage = (event: MessageEvent<WorkerStateMessage | WorkerErrorMessage>) => {
+    worker.onmessage = (
+      event: MessageEvent<WorkerStateMessage | WorkerErrorMessage>,
+    ) => {
       const message = event.data;
       if (message.type === "state") {
         const nextBars = message.state.bars ?? [];
@@ -530,7 +722,10 @@ export function useFootprint() {
         maxBars: settings.maxBars,
       },
     });
-    worker.postMessage({ type: "detector-config", config: signalControlRef.current });
+    worker.postMessage({
+      type: "detector-config",
+      config: signalControlRef.current,
+    });
 
     workerReadyRef.current = true;
 
@@ -578,7 +773,9 @@ export function useFootprint() {
 
     let storedHistory: TradingState["history"] | undefined;
     try {
-      const rawHistory = window.localStorage.getItem(TRADING_HISTORY_STORAGE_KEY);
+      const rawHistory = window.localStorage.getItem(
+        TRADING_HISTORY_STORAGE_KEY,
+      );
       if (rawHistory) {
         const parsed = JSON.parse(rawHistory);
         if (Array.isArray(parsed)) {
@@ -608,13 +805,19 @@ export function useFootprint() {
     signalControlRef.current = signalControl;
     if (typeof window !== "undefined") {
       try {
-        window.localStorage.setItem(SIGNAL_CONFIG_STORAGE_KEY, JSON.stringify(signalControl));
+        window.localStorage.setItem(
+          SIGNAL_CONFIG_STORAGE_KEY,
+          JSON.stringify(signalControl),
+        );
       } catch (error) {
         console.warn("Failed to persist signal config", error);
       }
     }
     if (workerRef.current && workerReadyRef.current) {
-      workerRef.current.postMessage({ type: "detector-config", config: signalControl });
+      workerRef.current.postMessage({
+        type: "detector-config",
+        config: signalControl,
+      });
     }
   }, [signalControl]);
 
@@ -708,9 +911,11 @@ export function useFootprint() {
     if (typeof window === "undefined") {
       return () => {};
     }
+    if (mode !== "live") {
+      return () => {};
+    }
 
     const stream = new BinanceAggTradeStream(settings.symbol, {
-      onTrade: processIncomingTrade,
       onStatusChange: handleStatusChange,
       onError: (message) => setLastError(message),
     });
@@ -727,7 +932,13 @@ export function useFootprint() {
       recoveryQueueRef.current = [];
       backfillPromiseRef.current = null;
     };
-  }, [settings.symbol, processIncomingTrade, handleStatusChange, flushTrades]);
+  }, [
+    mode,
+    settings.symbol,
+    processIncomingTrade,
+    handleStatusChange,
+    flushTrades,
+  ]);
 
   useEffect(() => {
     if (!workerReadyRef.current || !workerRef.current) {
@@ -777,12 +988,18 @@ export function useFootprint() {
     }
     const snapshot = engine.getPersistenceSnapshot();
     try {
-      window.localStorage.setItem(TRADING_SETTINGS_STORAGE_KEY, JSON.stringify(snapshot.settings));
+      window.localStorage.setItem(
+        TRADING_SETTINGS_STORAGE_KEY,
+        JSON.stringify(snapshot.settings),
+      );
     } catch (error) {
       console.warn("Failed to persist trading settings", error);
     }
     try {
-      window.localStorage.setItem(TRADING_HISTORY_STORAGE_KEY, JSON.stringify(snapshot.history));
+      window.localStorage.setItem(
+        TRADING_HISTORY_STORAGE_KEY,
+        JSON.stringify(snapshot.history),
+      );
     } catch (error) {
       console.warn("Failed to persist trading history", error);
     }
@@ -792,9 +1009,12 @@ export function useFootprint() {
     setSettings((prev) => ({ ...prev, ...partial }));
   }, []);
 
-  const setTimeframe = useCallback((timeframe: Timeframe) => {
-    updateSettings({ timeframe });
-  }, [updateSettings]);
+  const setTimeframe = useCallback(
+    (timeframe: Timeframe) => {
+      updateSettings({ timeframe });
+    },
+    [updateSettings],
+  );
 
   const setPriceStep = useCallback((priceStep: number) => {
     setSettings((prev) => {
@@ -832,27 +1052,33 @@ export function useFootprint() {
     }));
   }, []);
 
-  const updateSignalOverrides = useCallback((overrides: Partial<DetectorOverrides>) => {
-    setSignalControl((prev) => ({
-      ...prev,
-      overrides: {
-        ...prev.overrides,
-        ...overrides,
-      },
-    }));
-  }, []);
+  const updateSignalOverrides = useCallback(
+    (overrides: Partial<DetectorOverrides>) => {
+      setSignalControl((prev) => ({
+        ...prev,
+        overrides: {
+          ...prev.overrides,
+          ...overrides,
+        },
+      }));
+    },
+    [],
+  );
 
-  const updateTradingSettings = useCallback((partial: Partial<TradingSettings>) => {
-    const engine = tradingEngineRef.current;
-    if (!engine) {
-      return false;
-    }
-    const changed = engine.updateSettings(partial);
-    if (changed) {
-      setTradingState(engine.getState());
-    }
-    return changed;
-  }, []);
+  const updateTradingSettings = useCallback(
+    (partial: Partial<TradingSettings>) => {
+      const engine = tradingEngineRef.current;
+      if (!engine) {
+        return false;
+      }
+      const changed = engine.updateSettings(partial);
+      if (changed) {
+        setTradingState(engine.getState());
+      }
+      return changed;
+    },
+    [],
+  );
 
   const takeSignal = useCallback((signalId: string) => {
     const engine = tradingEngineRef.current;
@@ -890,17 +1116,20 @@ export function useFootprint() {
     return closed;
   }, []);
 
-  const applyInvalidationAction = useCallback((eventId: string, action: InvalidationActionType) => {
-    const engine = tradingEngineRef.current;
-    if (!engine) {
-      return false;
-    }
-    const changed = engine.applyInvalidationAction(eventId, action);
-    if (changed) {
-      setTradingState(engine.getState());
-    }
-    return changed;
-  }, []);
+  const applyInvalidationAction = useCallback(
+    (eventId: string, action: InvalidationActionType) => {
+      const engine = tradingEngineRef.current;
+      if (!engine) {
+        return false;
+      }
+      const changed = engine.applyInvalidationAction(eventId, action);
+      if (changed) {
+        setTradingState(engine.getState());
+      }
+      return changed;
+    },
+    [],
+  );
 
   const resetTradingDay = useCallback(() => {
     const engine = tradingEngineRef.current;
@@ -911,12 +1140,241 @@ export function useFootprint() {
     setTradingState(engine.getState());
   }, []);
 
-  const exportTradingHistory = useCallback((format: "json" | "csv" = "json") => {
-    const engine = tradingEngineRef.current;
-    if (!engine) {
-      return "";
+  const exportTradingHistory = useCallback(
+    (format: "json" | "csv" = "json") => {
+      const engine = tradingEngineRef.current;
+      if (!engine) {
+        return "";
+      }
+      return engine.exportHistory(format);
+    },
+    [],
+  );
+
+  const startReplay = useCallback(
+    async (
+      datasetId: string,
+      speed: ReplaySpeed = replayStateRef.current.speed ?? 1,
+    ) => {
+      const recorder = recorderRef.current;
+      if (!recorder) {
+        return false;
+      }
+      try {
+        const storage = recorder.getStorage();
+        const dataset = await storage.getDataset(datasetId);
+        if (!dataset) {
+          setReplayState((prev) => ({
+            ...prev,
+            datasetId,
+            status: "error",
+            error: "Dataset not found",
+          }));
+          return false;
+        }
+
+        setReplayMetrics({ perMode: [] });
+        setReplayState({
+          datasetId,
+          speed,
+          status: "loading",
+          progress: 0,
+          error: null,
+          durationMs: dataset.durationMs ?? null,
+          startedAt: Date.now(),
+          completedAt: null,
+        });
+        setMode("replay");
+        setConnectionStatus("connecting");
+        setLastError(null);
+
+        liveSettingsRef.current = { ...settings };
+        if (streamRef.current) {
+          streamRef.current.disconnect();
+          streamRef.current = null;
+        }
+
+        liveEngineRef.current = tradingEngineRef.current;
+
+        const baseSettings = tradingEngineRef.current?.getSettings();
+        const replayEngine = new TradingEngine({
+          priceStep: dataset.priceStep,
+          timeframeMs: timeframeToMs(dataset.timeframe),
+          settings: baseSettings,
+        });
+        tradingEngineRef.current = replayEngine;
+        setTradingState(replayEngine.getState());
+
+        setSettings((prev) => ({
+          ...prev,
+          symbol: dataset.symbol,
+          timeframe: dataset.timeframe,
+          priceStep: dataset.priceStep,
+        }));
+
+        workerRef.current?.postMessage({ type: "clear" });
+        tradeBufferRef.current = [];
+        setBars([]);
+        setSignals([]);
+        setSignalStats(normalizeSignalStats());
+
+        resetTradeIdCache(tradeIdCacheRef.current);
+        lastTradeTimeRef.current = null;
+        recoveringRef.current = false;
+        recoveryQueueRef.current = [];
+        backfillPromiseRef.current = null;
+
+        const replayer = new AggTradeReplayer(storage);
+        replayerRef.current = replayer;
+
+        await replayer.start(datasetId, {
+          speed,
+          onTrade: processIncomingTrade,
+          onProgress: (progress) => {
+            setReplayState((prev) => ({
+              ...prev,
+              progress,
+            }));
+          },
+          onStatusChange: (status) => {
+            setReplayState((prev) => ({
+              ...prev,
+              status,
+            }));
+            if (status === "playing") {
+              setConnectionStatus("connected");
+            }
+          },
+          onComplete: () => {
+            setReplayState((prev) => ({
+              ...prev,
+              status: "complete",
+              progress: 1,
+              completedAt: Date.now(),
+            }));
+          },
+          onError: (error) => {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            setReplayState((prev) => ({
+              ...prev,
+              status: "error",
+              error: message,
+            }));
+            setLastError(message);
+          },
+        });
+
+        const cachedMetrics = datasetMetricsCacheRef.current.get(datasetId);
+        if (cachedMetrics) {
+          setReplayMetrics(cachedMetrics);
+        } else {
+          computeReplayMetrics(storage, datasetId)
+            .then((metrics) => {
+              datasetMetricsCacheRef.current.set(datasetId, metrics);
+              setReplayMetrics(metrics);
+            })
+            .catch((error) => {
+              console.warn("Failed to compute replay metrics", error);
+            });
+        }
+
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        replayerRef.current = null;
+        if (liveEngineRef.current) {
+          tradingEngineRef.current = liveEngineRef.current;
+          setTradingState(liveEngineRef.current.getState());
+          liveEngineRef.current = null;
+        }
+        if (liveSettingsRef.current) {
+          setSettings((prev) => ({
+            ...prev,
+            symbol: liveSettingsRef.current!.symbol,
+            timeframe: liveSettingsRef.current!.timeframe,
+            priceStep: liveSettingsRef.current!.priceStep,
+          }));
+          liveSettingsRef.current = null;
+        }
+        setMode("live");
+        setConnectionStatus("connecting");
+        setReplayState((prev) => ({
+          ...prev,
+          datasetId,
+          status: "error",
+          error: message,
+        }));
+        setLastError(message);
+        return false;
+      }
+    },
+    [settings, processIncomingTrade],
+  );
+
+  const stopReplay = useCallback(async () => {
+    const replayer = replayerRef.current;
+    if (replayer) {
+      try {
+        await replayer.stop();
+      } catch (error) {
+        console.warn("Failed to stop replay", error);
+      }
+      replayerRef.current = null;
     }
-    return engine.exportHistory(format);
+
+    setReplayMetrics({ perMode: [] });
+    setReplayState({ ...INITIAL_REPLAY_STATE });
+
+    const savedSettings = liveSettingsRef.current;
+    if (savedSettings) {
+      setSettings((prev) => ({
+        ...prev,
+        symbol: savedSettings.symbol,
+        timeframe: savedSettings.timeframe,
+        priceStep: savedSettings.priceStep,
+      }));
+      liveSettingsRef.current = null;
+    }
+
+    const engine = liveEngineRef.current;
+    if (engine) {
+      tradingEngineRef.current = engine;
+      liveEngineRef.current = null;
+      setTradingState(engine.getState());
+    } else {
+      const fallback = new TradingEngine({
+        priceStep: settings.priceStep,
+        timeframeMs: timeframeToMs(settings.timeframe),
+      });
+      tradingEngineRef.current = fallback;
+      setTradingState(fallback.getState());
+    }
+
+    workerRef.current?.postMessage({ type: "clear" });
+    tradeBufferRef.current = [];
+    setBars([]);
+    setSignals([]);
+    setSignalStats(normalizeSignalStats());
+    resetTradeIdCache(tradeIdCacheRef.current);
+    lastTradeTimeRef.current = null;
+    recoveringRef.current = false;
+    recoveryQueueRef.current = [];
+    backfillPromiseRef.current = null;
+
+    setMode("live");
+    setConnectionStatus("connecting");
+    setLastError(null);
+  }, [settings.priceStep, settings.timeframe]);
+
+  const changeReplaySpeed = useCallback((speed: ReplaySpeed) => {
+    setReplayState((prev) => ({
+      ...prev,
+      speed,
+    }));
+    if (replayerRef.current) {
+      replayerRef.current.setSpeed(speed);
+    }
   }, []);
 
   return {
@@ -946,5 +1404,14 @@ export function useFootprint() {
     connectionDiagnostics,
     serverTimeOffsetMs,
     priceStepConfig,
+    mode,
+    recordingDataset,
+    availableDatasets,
+    replayState,
+    replayMetrics,
+    startReplay,
+    stopReplay,
+    setReplaySpeed: changeReplaySpeed,
+    refreshDatasets,
   };
 }

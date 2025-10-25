@@ -8,6 +8,62 @@ export interface Settings {
   showCumulativeDelta: boolean;
 }
 
+export type FootprintMode = "live" | "replay";
+
+export type ReplaySpeed = 1 | 2 | 5 | 10;
+
+export interface RecordingDatasetSummary {
+  id: string;
+  label: string;
+  symbol: string;
+  timeframe: Timeframe;
+  priceStep: number;
+  createdAt: number;
+  updatedAt: number;
+  startTime: number | null;
+  endTime: number | null;
+  totalTrades: number;
+  totalBytes: number;
+  chunkCount: number;
+  durationMs: number;
+}
+
+export interface RecordingChunkMeta {
+  id: string;
+  datasetId: string;
+  index: number;
+  startTime: number;
+  endTime: number;
+  tradeCount: number;
+  byteLength: number;
+  storedAt: number;
+  compressed: boolean;
+}
+
+export type ReplayStatus = "idle" | "loading" | "playing" | "paused" | "complete" | "error";
+
+export interface ReplayState {
+  datasetId: string | null;
+  speed: ReplaySpeed;
+  status: ReplayStatus;
+  progress: number;
+  error?: string | null;
+  durationMs?: number | null;
+  startedAt?: number | null;
+  completedAt?: number | null;
+}
+
+export interface ReplayModeSummary {
+  mode: SignalMode;
+  label: string;
+  estimatePerDay: number;
+  dailyCount: number;
+}
+
+export interface ReplayMetrics {
+  perMode: ReplayModeSummary[];
+}
+
 export interface SymbolMarketConfig {
   tickSize: number;
   stepSize: number;

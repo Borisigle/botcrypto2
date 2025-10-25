@@ -1,4 +1,4 @@
-'use client';
+"use client";
 
 import { useCallback, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
@@ -41,12 +41,24 @@ export default function Page() {
     connectionDiagnostics,
     serverTimeOffsetMs,
     priceStepConfig,
+    mode,
+    recordingDataset,
+    availableDatasets,
+    replayState,
+    replayMetrics,
+    startReplay,
+    stopReplay,
+    setReplaySpeed,
+    refreshDatasets,
   } = useFootprint();
 
   const [hover, setHover] = useState<HoverInfo | null>(null);
   const [tooltip, setTooltip] = useState<{ x: number; y: number } | null>(null);
 
-  const activeBarTime = useMemo(() => (hover ? formatTimestamp(hover.time) : null), [hover]);
+  const activeBarTime = useMemo(
+    () => (hover ? formatTimestamp(hover.time) : null),
+    [hover],
+  );
 
   const handleExportHistory = useCallback(
     (format: "json" | "csv") => {
@@ -71,9 +83,12 @@ export default function Page() {
   return (
     <main className="flex min-h-screen flex-col gap-6 bg-slate-950 px-4 pb-8 pt-6 text-slate-100 md:px-8">
       <header className="flex flex-col gap-1">
-        <h1 className="text-3xl font-semibold tracking-tight text-white">BTC Footprint Heatmap</h1>
+        <h1 className="text-3xl font-semibold tracking-tight text-white">
+          BTC Footprint Heatmap
+        </h1>
         <p className="text-sm text-slate-400">
-          Real-time Binance Futures BTCUSDT footprint with delta heatmap and cumulative delta tracking.
+          Real-time Binance Futures BTCUSDT footprint with delta heatmap and
+          cumulative delta tracking.
         </p>
       </header>
 
@@ -94,7 +109,11 @@ export default function Page() {
               }}
             />
             {hover && tooltip ? (
-              <Tooltip hover={hover} position={tooltip} formattedTime={activeBarTime} />
+              <Tooltip
+                hover={hover}
+                position={tooltip}
+                formattedTime={activeBarTime}
+              />
             ) : null}
           </div>
           {settings.showCumulativeDelta ? <CumDeltaChart bars={bars} /> : null}
@@ -118,7 +137,18 @@ export default function Page() {
             showCumulativeDelta={settings.showCumulativeDelta}
             signalControl={signalControl}
             signalStats={signalStats}
-            onSymbolChange={(symbol) => updateSettings({ symbol: symbol || "BTCUSDT" })}
+            mode={mode}
+            recordingDataset={recordingDataset}
+            availableDatasets={availableDatasets}
+            replayState={replayState}
+            replayMetrics={replayMetrics}
+            onStartReplay={startReplay}
+            onStopReplay={stopReplay}
+            onReplaySpeedChange={setReplaySpeed}
+            onRefreshDatasets={refreshDatasets}
+            onSymbolChange={(symbol) =>
+              updateSettings({ symbol: symbol || "BTCUSDT" })
+            }
             onTimeframeChange={setTimeframe}
             onPriceStepChange={setPriceStep}
             onToggleCumulativeDelta={toggleCumulativeDelta}
@@ -137,6 +167,7 @@ export default function Page() {
 
       <StatusBar
         status={connectionStatus}
+        mode={mode}
         symbol={settings.symbol}
         timeframe={settings.timeframe}
         priceStep={settings.priceStep}
@@ -174,13 +205,17 @@ function Tooltip({ hover, position, formattedTime }: TooltipProps) {
       style={style}
     >
       <div className="flex items-center justify-between text-white/70">
-        <span className="font-semibold text-white">{hover.price.toFixed(2)}</span>
+        <span className="font-semibold text-white">
+          {hover.price.toFixed(2)}
+        </span>
         {formattedTime ? <span>{formattedTime}</span> : null}
       </div>
       <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1">
         <div>
           <dt className="text-slate-400">Ask Vol</dt>
-          <dd className="font-mono text-emerald-300">{hover.askVol.toFixed(3)}</dd>
+          <dd className="font-mono text-emerald-300">
+            {hover.askVol.toFixed(3)}
+          </dd>
         </div>
         <div>
           <dt className="text-slate-400">Bid Vol</dt>
@@ -188,13 +223,17 @@ function Tooltip({ hover, position, formattedTime }: TooltipProps) {
         </div>
         <div>
           <dt className="text-slate-400">Delta</dt>
-          <dd className={`font-mono ${hover.delta >= 0 ? "text-emerald-300" : "text-rose-300"}`}>
+          <dd
+            className={`font-mono ${hover.delta >= 0 ? "text-emerald-300" : "text-rose-300"}`}
+          >
             {hover.delta.toFixed(3)}
           </dd>
         </div>
         <div>
           <dt className="text-slate-400">Total</dt>
-          <dd className="font-mono text-white/80">{hover.totalVolume.toFixed(3)}</dd>
+          <dd className="font-mono text-white/80">
+            {hover.totalVolume.toFixed(3)}
+          </dd>
         </div>
       </dl>
     </div>
