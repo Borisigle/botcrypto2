@@ -25,6 +25,10 @@ const numberOrNull = (value: string): number | null => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+const clampNumber = (value: number, min: number, max: number): number => {
+  return Math.min(Math.max(value, min), max);
+};
+
 const SESSION_OPTIONS: Array<{ key: TradingSession; label: string }> = [
   { key: "asia", label: "Asia" },
   { key: "eu", label: "Europa" },

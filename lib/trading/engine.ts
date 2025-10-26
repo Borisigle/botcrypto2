@@ -2663,7 +2663,7 @@ export class TradingEngine {
         depth: [],
       },
     };
-
+  }
 
   private evaluateTimeDecay(
     position: Position,
@@ -2712,7 +2712,7 @@ export class TradingEngine {
         depth: [],
       },
     };
-
+  }
 
   private evaluateLiquiditySweep(
     position: Position,
@@ -2793,7 +2793,7 @@ export class TradingEngine {
         depth: thesisDepth,
       },
     };
-
+  }
 
   private buildInvalidationEvent(args: {
     position: Position;
