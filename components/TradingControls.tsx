@@ -1,3 +1,5 @@
+"use client";
+
 import type { ChangeEvent } from "react";
 
 import type { TradingSession, TradingSettings } from "@/types";
@@ -508,7 +510,7 @@ export function TradingControls({ settings, onSettingsChange, onResetDay, onExpo
       </div>
 
       <div className="flex flex-wrap gap-3">
-
+        <button
           type="button"
           className="flex-1 rounded-md border border-emerald-400 bg-emerald-500/20 px-3 py-2 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30"
           onClick={() => onExport("json")}
