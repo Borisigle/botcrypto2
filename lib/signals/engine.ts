@@ -526,6 +526,13 @@ export class SignalEngine {
       strategy: bestHit.strategy,
       strategies,
       levelLabel: keyMatch?.label ?? null,
+      keyLevel: keyMatch
+        ? {
+            label: keyMatch.label,
+            price: roundToStep(keyMatch.price, this.priceStep),
+            distancePercent: keyMatch.distancePercent,
+          }
+        : null,
       evidence: mergedEvidence,
     };
 
