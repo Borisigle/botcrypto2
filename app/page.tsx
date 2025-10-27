@@ -20,10 +20,16 @@ export default function Page() {
     signalStats,
     signalControl,
     settings,
+    chartKeyLevels,
+    keyLevelSummaries,
+    statusNotices,
     updateSettings,
     setTimeframe,
     setPriceStep,
     toggleCumulativeDelta,
+    toggleGrid,
+    togglePriceAxis,
+    toggleKeyLevelVisibility,
     setSignalMode,
     toggleStrategy: toggleSignalStrategy,
     updateSignalOverrides,
@@ -105,6 +111,10 @@ export default function Page() {
               invalidations={tradingState.invalidations}
               priceStep={settings.priceStep}
               priceBounds={priceBounds}
+              keyLevels={chartKeyLevels}
+              showGrid={settings.showGrid}
+              showPriceAxis={settings.showPriceAxis}
+              tickSize={priceStepConfig.step}
               onHover={(info, position) => {
                 setHover(info);
                 setTooltip(position ?? null);
@@ -137,6 +147,10 @@ export default function Page() {
             priceStep={settings.priceStep}
             priceStepConfig={priceStepConfig}
             showCumulativeDelta={settings.showCumulativeDelta}
+            showGrid={settings.showGrid}
+            showPriceAxis={settings.showPriceAxis}
+            keyLevelVisibility={settings.keyLevelVisibility}
+            keyLevelSummaries={keyLevelSummaries}
             signalControl={signalControl}
             signalStats={signalStats}
             mode={mode}
@@ -154,6 +168,9 @@ export default function Page() {
             onTimeframeChange={setTimeframe}
             onPriceStepChange={setPriceStep}
             onToggleCumulativeDelta={toggleCumulativeDelta}
+            onToggleGrid={toggleGrid}
+            onTogglePriceAxis={togglePriceAxis}
+            onToggleKeyLevels={toggleKeyLevelVisibility}
             onModeChange={setSignalMode}
             onToggleStrategy={toggleSignalStrategy}
             onOverridesChange={updateSignalOverrides}
@@ -179,6 +196,7 @@ export default function Page() {
         depthStatus={depthStatus}
         depthMeta={depthStatusMeta}
         lastError={lastError}
+        notices={statusNotices}
       />
     </main>
   );

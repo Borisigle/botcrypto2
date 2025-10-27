@@ -1,11 +1,41 @@
 export type Timeframe = "1m" | "5m";
 
+export interface KeyLevelVisibility {
+  previousDay: boolean;
+  sessionVwap: boolean;
+  currentDay: boolean;
+  priorDayPoc: boolean;
+}
+
+export type KeyLevelType =
+  | "pdh"
+  | "pdl"
+  | "session-vwap"
+  | "session-high"
+  | "session-low"
+  | "current-high"
+  | "current-low"
+  | "prior-day-poc";
+
+export type KeyLevelStatus = "approximate" | "live" | "mixed" | "unavailable";
+
+export interface ChartKeyLevel {
+  id: string;
+  label: string;
+  price: number;
+  type: KeyLevelType;
+  status?: KeyLevelStatus;
+}
+
 export interface Settings {
   symbol: string;
   timeframe: Timeframe;
   priceStep: number;
   maxBars: number;
   showCumulativeDelta: boolean;
+  showGrid: boolean;
+  showPriceAxis: boolean;
+  keyLevelVisibility: KeyLevelVisibility;
 }
 
 export type FootprintMode = "live" | "replay";
@@ -121,6 +151,16 @@ export interface LevelBin {
   totalVolume: number;
 }
 
+export interface HistoricalFootprintBarSeed {
+  startTime: number;
+  endTime: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
 export interface FootprintBar {
   startTime: number;
   endTime: number;
@@ -134,6 +174,7 @@ export interface FootprintBar {
   lowPrice: number;
   openPrice: number;
   closePrice: number;
+  skeleton?: boolean;
   depth?: DepthBarMetrics | null;
 }
 

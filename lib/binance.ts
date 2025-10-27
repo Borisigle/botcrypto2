@@ -5,6 +5,27 @@ const REST_BASE = "https://fapi.binance.com/fapi/v1";
 const MAX_BACKOFF = 30_000;
 const MAX_AGG_TRADE_LIMIT = 1000;
 
+export type KlineInterval = "1m" | "3m" | "5m" | "15m" | "30m" | "1h" | "4h" | "1d";
+
+export interface FetchKlinesParams {
+  symbol: string;
+  interval: KlineInterval | string;
+  limit?: number;
+  startTime?: number;
+  endTime?: number;
+}
+
+export interface Kline {
+  openTime: number;
+  closeTime: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  trades: number;
+}
+
 export const ALLOWED_DEPTH_LIMITS = [5, 10, 20, 50, 100, 500, 1000] as const;
 type AllowedDepthLimit = (typeof ALLOWED_DEPTH_LIMITS)[number];
 const DEFAULT_DEPTH_LIMIT: AllowedDepthLimit = 100;
@@ -338,6 +359,82 @@ export async function fetchAggTrades(params: FetchAggTradesParams): Promise<Trad
 
   trades.sort((a, b) => (a.timestamp - b.timestamp) || (a.tradeId - b.tradeId));
   return trades;
+}
+
+export async function fetchKlines(params: FetchKlinesParams): Promise<Kline[]> {
+  ensureFetch();
+  const { symbol, interval, limit, startTime, endTime } = params;
+  const url = new URL(`${REST_BASE}/klines`);
+  url.searchParams.set("symbol", symbol.toUpperCase());
+  url.searchParams.set("interval", interval);
+
+  if (typeof limit === "number" && Number.isFinite(limit)) {
+    const capped = Math.min(Math.max(Math.floor(limit), 1), 1500);
+    url.searchParams.set("limit", String(capped));
+  } else if (typeof startTime === "undefined" && typeof endTime === "undefined") {
+    url.searchParams.set("limit", "500");
+  }
+
+  if (typeof startTime === "number" && Number.isFinite(startTime)) {
+    url.searchParams.set("startTime", String(Math.max(0, Math.floor(startTime))));
+  }
+  if (typeof endTime === "number" && Number.isFinite(endTime)) {
+    url.searchParams.set("endTime", String(Math.max(0, Math.floor(endTime))));
+  }
+
+  const response = await fetch(url.toString());
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Binance klines: ${response.status}`);
+  }
+
+  const payload = (await response.json()) as unknown[];
+  if (!Array.isArray(payload)) {
+    return [];
+  }
+
+  const klines: Kline[] = [];
+  for (const entry of payload) {
+    if (!Array.isArray(entry) || entry.length < 7) {
+      continue;
+    }
+
+    const openTime = safeNumber(entry[0]);
+    const open = safeNumber(entry[1]);
+    const high = safeNumber(entry[2]);
+    const low = safeNumber(entry[3]);
+    const close = safeNumber(entry[4]);
+    const volumeValue = safeNumber(entry[5]);
+    const closeTime = safeNumber(entry[6]);
+    const tradesValue = safeNumber(entry[8]);
+
+    if (
+      openTime === null ||
+      closeTime === null ||
+      open === null ||
+      high === null ||
+      low === null ||
+      close === null
+    ) {
+      continue;
+    }
+
+    const volume = volumeValue !== null ? Math.max(0, volumeValue) : 0;
+    const trades = tradesValue !== null ? Math.max(0, Math.trunc(tradesValue)) : 0;
+
+    klines.push({
+      openTime: Math.trunc(openTime),
+      closeTime: Math.trunc(closeTime),
+      open,
+      high,
+      low,
+      close,
+      volume,
+      trades,
+    });
+  }
+
+  klines.sort((a, b) => a.openTime - b.openTime);
+  return klines;
 }
 
 export async function fetchSymbolMarketConfig(symbol: string): Promise<SymbolMarketConfig | null> {

@@ -6,8 +6,10 @@ import { timeframeToMs } from "@/lib/aggregator";
 import {
   BinanceAggTradeStream,
   fetchAggTrades,
+  fetchKlines,
   fetchServerTime,
   fetchSymbolMarketConfig,
+  type Kline,
   type StreamStatusMeta,
 } from "@/lib/binance";
 import { BinanceDepthStream } from "@/lib/depth";
@@ -17,16 +19,20 @@ import { computeReplayMetrics } from "@/lib/replay/summary";
 import { TradingEngine, DEFAULT_TRADING_SETTINGS } from "@/lib/trading/engine";
 import { createDefaultSignalControlState } from "@/lib/signals";
 import type {
+  ChartKeyLevel,
   ConnectionDiagnostics,
   ConnectionStatus,
   DepthState,
   DepthStreamMessage,
   DetectorOverrides,
   FootprintBar,
+  FootprintMode,
   FootprintSignal,
   FootprintState,
-  FootprintMode,
+  HistoricalFootprintBarSeed,
   InvalidationActionType,
+  KeyLevelStatus,
+  KeyLevelVisibility,
   RecordingDatasetSummary,
   ReplayMetrics,
   ReplaySpeed,
@@ -49,6 +55,14 @@ const DEFAULT_SETTINGS: Settings = {
   priceStep: 0.5,
   maxBars: 400,
   showCumulativeDelta: true,
+  showGrid: true,
+  showPriceAxis: true,
+  keyLevelVisibility: {
+    previousDay: true,
+    sessionVwap: true,
+    currentDay: true,
+    priorDayPoc: false,
+  },
 };
 
 const FLUSH_INTERVAL = 200;
@@ -108,6 +122,15 @@ const INITIAL_REPLAY_STATE: ReplayState = {
   completedAt: null,
 };
 
+const INITIAL_KEY_LEVEL_STATE: KeyLevelState = {
+  previousDayHigh: { price: null, status: "unavailable" },
+  previousDayLow: { price: null, status: "unavailable" },
+  currentDayHigh: { price: null, status: "unavailable" },
+  currentDayLow: { price: null, status: "unavailable" },
+  sessionVwap: { price: null, status: "unavailable" },
+  priorDayPoc: { price: null, status: "unavailable" },
+};
+
 interface PriceBounds {
   min: number;
   max: number;
@@ -122,6 +145,22 @@ interface WorkerStateMessage {
 interface WorkerErrorMessage {
   type: "error";
   message: string;
+}
+
+interface ScalarLevel {
+  price: number | null;
+  status: KeyLevelStatus;
+}
+
+interface SessionVwapLevel extends ScalarLevel {}
+
+interface KeyLevelState {
+  previousDayHigh: ScalarLevel;
+  previousDayLow: ScalarLevel;
+  currentDayHigh: ScalarLevel;
+  currentDayLow: ScalarLevel;
+  sessionVwap: SessionVwapLevel;
+  priorDayPoc: ScalarLevel;
 }
 
 interface TradeIdCache {
@@ -169,6 +208,122 @@ function resetTradeIdCache(cache: TradeIdCache) {
   cache.set.clear();
   cache.queue = [];
   cache.start = 0;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function fetchKlinesWithFallback(
+  params: Parameters<typeof fetchKlines>[0],
+  limits: number[],
+): Promise<Kline[]> {
+  let lastError: unknown = null;
+  for (const limit of limits) {
+    const clampedLimit = Math.max(1, Math.floor(limit));
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await fetchKlines({ ...params, limit: clampedLimit });
+      } catch (error) {
+        lastError = error;
+        await delay(250 * (attempt + 1));
+      }
+    }
+  }
+
+  if (lastError instanceof Error) {
+    throw lastError;
+  }
+  if (lastError) {
+    throw new Error(String(lastError));
+  }
+  return [];
+}
+
+function mapKlinesToSeeds(klines: Kline[]): HistoricalFootprintBarSeed[] {
+  return klines
+    .map((kline) => ({
+      startTime: kline.openTime,
+      endTime: kline.closeTime,
+      open: kline.open,
+      high: kline.high,
+      low: kline.low,
+      close: kline.close,
+      volume: kline.volume,
+    }))
+    .filter((seed) =>
+      Number.isFinite(seed.startTime) &&
+      Number.isFinite(seed.endTime) &&
+      Number.isFinite(seed.open) &&
+      Number.isFinite(seed.high) &&
+      Number.isFinite(seed.low) &&
+      Number.isFinite(seed.close),
+    )
+    .sort((a, b) => a.startTime - b.startTime);
+}
+
+function computeSessionStats(klines: Kline[]): {
+  high: number | null;
+  low: number | null;
+  vwap: number | null;
+  volume: number;
+} {
+  let high = Number.NEGATIVE_INFINITY;
+  let low = Number.POSITIVE_INFINITY;
+  let numerator = 0;
+  let denominator = 0;
+
+  for (const kline of klines) {
+    if (!Number.isFinite(kline.high) || !Number.isFinite(kline.low) || !Number.isFinite(kline.close)) {
+      continue;
+    }
+    high = Math.max(high, kline.high);
+    low = Math.min(low, kline.low);
+    const volume = Number.isFinite(kline.volume) && kline.volume > 0 ? kline.volume : 0;
+    if (volume > 0) {
+      const typical = (kline.high + kline.low + kline.close) / 3;
+      numerator += typical * volume;
+      denominator += volume;
+    }
+  }
+
+  const hasHigh = Number.isFinite(high) && high !== Number.NEGATIVE_INFINITY;
+  const hasLow = Number.isFinite(low) && low !== Number.POSITIVE_INFINITY;
+  const vwap = denominator > 0 ? numerator / denominator : null;
+
+  return {
+    high: hasHigh ? high : null,
+    low: hasLow ? low : null,
+    vwap,
+    volume: denominator,
+  };
+}
+
+function extractPreviousDayLevels(klines: Kline[], sessionStart: number): {
+  high: number | null;
+  low: number | null;
+} {
+  let candidate: Kline | null = null;
+
+  for (const kline of klines) {
+    if (kline.openTime < sessionStart) {
+      if (!candidate || kline.openTime > candidate.openTime) {
+        candidate = kline;
+      }
+    }
+  }
+
+  return {
+    high: candidate ? candidate.high : null,
+    low: candidate ? candidate.low : null,
+  };
+}
+
+function getUtcSessionStart(timestamp: number): number {
+  const date = new Date(timestamp);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
 }
 
 function mergeSignalControl(
@@ -260,6 +415,9 @@ export function useFootprint() {
   const [depthStatus, setDepthStatus] =
     useState<ConnectionStatus>("connecting");
   const [depthStatusMeta, setDepthStatusMeta] = useState<StreamStatusMeta | null>(null);
+  const [keyLevelState, setKeyLevelState] = useState<KeyLevelState>(INITIAL_KEY_LEVEL_STATE);
+  const [statusNotices, setStatusNotices] = useState<string[]>([]);
+  const [workerReady, setWorkerReady] = useState(false);
 
   const priceBounds = useMemo<PriceBounds | null>(() => {
     if (!bars.length) {
@@ -300,6 +458,81 @@ export function useFootprint() {
     [marketConfig],
   );
 
+  const chartKeyLevels = useMemo<ChartKeyLevel[]>(() => {
+    const lines: ChartKeyLevel[] = [];
+    const visibility = settings.keyLevelVisibility;
+
+    const pushLevel = (
+      id: string,
+      label: string,
+      level: ScalarLevel,
+      type: ChartKeyLevel["type"],
+    ) => {
+      if (level.price === null || !Number.isFinite(level.price)) {
+        return;
+      }
+      lines.push({
+        id,
+        label,
+        price: level.price,
+        type,
+        status: level.status,
+      });
+    };
+
+    if (visibility.previousDay) {
+      pushLevel("key-pdh", "PDH", keyLevelState.previousDayHigh, "pdh");
+      pushLevel("key-pdl", "PDL", keyLevelState.previousDayLow, "pdl");
+    }
+
+    if (visibility.sessionVwap) {
+      pushLevel("key-session-vwap", "Sess VWAP", keyLevelState.sessionVwap, "session-vwap");
+    }
+
+    if (visibility.currentDay) {
+      pushLevel("key-day-high", "Day High", keyLevelState.currentDayHigh, "current-high");
+      pushLevel("key-day-low", "Day Low", keyLevelState.currentDayLow, "current-low");
+    }
+
+    if (visibility.priorDayPoc) {
+      pushLevel("key-prior-poc", "PD POC", keyLevelState.priorDayPoc, "prior-day-poc");
+    }
+
+    return lines;
+  }, [keyLevelState, settings.keyLevelVisibility]);
+
+  const keyLevelSummaries = useMemo<Record<keyof KeyLevelVisibility, KeyLevelStatus>>(() => {
+    const summarize = (levels: Array<{ status: KeyLevelStatus }>): KeyLevelStatus => {
+      if (levels.some((level) => level.status === "live")) {
+        return "live";
+      }
+      if (levels.some((level) => level.status === "mixed")) {
+        return "mixed";
+      }
+      if (levels.some((level) => level.status === "approximate")) {
+        return "approximate";
+      }
+      return "unavailable";
+    };
+
+    return {
+      previousDay: summarize([keyLevelState.previousDayHigh, keyLevelState.previousDayLow]),
+      sessionVwap: summarize([keyLevelState.sessionVwap]),
+      currentDay: summarize([keyLevelState.currentDayHigh, keyLevelState.currentDayLow]),
+      priorDayPoc: keyLevelState.priorDayPoc.status,
+    };
+  }, [keyLevelState]);
+
+  const pushStatusNotice = useCallback((message: string) => {
+    setStatusNotices((prev) => {
+      if (prev.length && prev[0] === message) {
+        return prev;
+      }
+      const next = [message, ...prev];
+      return next.slice(0, 3);
+    });
+  }, []);
+
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
@@ -307,6 +540,253 @@ export function useFootprint() {
   useEffect(() => {
     replayStateRef.current = replayState;
   }, [replayState]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return () => {};
+    }
+
+    let cancelled = false;
+    const symbol = settings.symbol;
+    const timeframe = settings.timeframe;
+
+    const run = async () => {
+      const serverNow = Date.now() + serverTimeOffsetRef.current;
+      const sessionStart = getUtcSessionStart(serverNow);
+
+      if (mode === "live") {
+        setKeyLevelState(INITIAL_KEY_LEVEL_STATE);
+      }
+
+      try {
+        const primaryLimits = timeframe === "5m" ? [80, 60, 30] : [80, 60, 40];
+        const primaryKlines = await fetchKlinesWithFallback(
+          { symbol, interval: timeframe, limit: primaryLimits[0] },
+          primaryLimits,
+        );
+
+        const seeds = mapKlinesToSeeds(primaryKlines).slice(-50);
+
+        const minutesSinceStart = Math.max(1, Math.ceil((serverNow - sessionStart) / 60_000));
+        const sessionLimit = Math.min(1500, minutesSinceStart + 5);
+        const sessionKlines = await fetchKlinesWithFallback(
+          {
+            symbol,
+            interval: "1m",
+            startTime: sessionStart,
+            endTime: serverNow,
+            limit: sessionLimit,
+          },
+          [sessionLimit, Math.min(sessionLimit, 720), Math.min(sessionLimit, 360)],
+        );
+
+        const dailyKlines = await fetchKlinesWithFallback(
+          { symbol, interval: "1d", limit: 2 },
+          [2, 1],
+        );
+
+        if (cancelled) {
+          return;
+        }
+
+        const sessionStats = computeSessionStats(sessionKlines);
+        const prevDayLevels = extractPreviousDayLevels(dailyKlines, sessionStart);
+
+        const nextKeyLevels: KeyLevelState = {
+          previousDayHigh: {
+            price: prevDayLevels.high,
+            status: prevDayLevels.high !== null ? "live" : "unavailable",
+          },
+          previousDayLow: {
+            price: prevDayLevels.low,
+            status: prevDayLevels.low !== null ? "live" : "unavailable",
+          },
+          currentDayHigh: {
+            price: sessionStats.high,
+            status: sessionStats.high !== null ? "approximate" : "unavailable",
+          },
+          currentDayLow: {
+            price: sessionStats.low,
+            status: sessionStats.low !== null ? "approximate" : "unavailable",
+          },
+          sessionVwap: {
+            price: sessionStats.vwap,
+            status: sessionStats.vwap !== null ? "approximate" : "unavailable",
+          },
+          priorDayPoc: {
+            price: null,
+            status: "unavailable",
+          },
+        };
+
+        seedContextRef.current = {
+          symbol,
+          timeframe,
+          seeds,
+          sessionStart,
+        };
+        sessionStartRef.current = sessionStart;
+        setKeyLevelState(nextKeyLevels);
+
+        if (mode === "live" && workerReady && workerRef.current) {
+          workerRef.current.postMessage({ type: "seed", seeds });
+          if (seeds.length) {
+            pushStatusNotice("Seeded 50 bars from history");
+          }
+        }
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        setLastError((prev) => prev ?? message);
+        if (mode === "live") {
+          pushStatusNotice("Failed to seed history");
+        }
+      }
+    };
+
+    if (mode === "live" || mode === "replay") {
+      void run();
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, settings.symbol, settings.timeframe, workerReady, pushStatusNotice]);
+
+  useEffect(() => {
+    if (!workerReady || !workerRef.current) {
+      return;
+    }
+    const context = seedContextRef.current;
+    if (!context || !context.seeds.length) {
+      return;
+    }
+    workerRef.current.postMessage({ type: "seed", seeds: context.seeds });
+    if (
+      mode === "live" &&
+      context.symbol === settings.symbol &&
+      context.timeframe === settings.timeframe &&
+      context.seeds.length
+    ) {
+      pushStatusNotice("Seeded 50 bars from history");
+    }
+  }, [workerReady, mode, settings.symbol, settings.timeframe, pushStatusNotice]);
+
+  useEffect(() => {
+    if (!workerReady || !workerRef.current) {
+      return;
+    }
+    const context = seedContextRef.current;
+    if (!context || !context.seeds.length) {
+      return;
+    }
+    workerRef.current.postMessage({ type: "seed", seeds: context.seeds });
+  }, [settings.priceStep, workerReady]);
+
+  useEffect(() => {
+    const sessionStart = sessionStartRef.current;
+    if (!Number.isFinite(sessionStart)) {
+      return;
+    }
+
+    let high = Number.NEGATIVE_INFINITY;
+    let low = Number.POSITIVE_INFINITY;
+    let numerator = 0;
+    let denominator = 0;
+    let skeletonPresent = false;
+    let livePresent = false;
+    let countedBars = 0;
+
+    for (const bar of bars) {
+      if (bar.startTime < (sessionStart as number)) {
+        continue;
+      }
+      countedBars += 1;
+      if (Number.isFinite(bar.highPrice)) {
+        high = Math.max(high, bar.highPrice);
+      }
+      if (Number.isFinite(bar.lowPrice)) {
+        low = Math.min(low, bar.lowPrice);
+      }
+      const volume = Number.isFinite(bar.totalVolume) && bar.totalVolume > 0 ? bar.totalVolume : 0;
+      if (volume > 0 && Number.isFinite(bar.highPrice) && Number.isFinite(bar.lowPrice) && Number.isFinite(bar.closePrice)) {
+        const typical = (bar.highPrice + bar.lowPrice + bar.closePrice) / 3;
+        numerator += typical * volume;
+        denominator += volume;
+      }
+      if (bar.skeleton) {
+        skeletonPresent = true;
+      } else {
+        livePresent = true;
+      }
+    }
+
+    if (countedBars === 0) {
+      return;
+    }
+
+    const hasHigh = Number.isFinite(high) && high !== Number.NEGATIVE_INFINITY;
+    const hasLow = Number.isFinite(low) && low !== Number.POSITIVE_INFINITY;
+    const vwapValue = denominator > 0 ? numerator / denominator : null;
+
+    const statusFor = (hasValue: boolean, prevStatus: KeyLevelStatus): KeyLevelStatus => {
+      if (!hasValue) {
+        return prevStatus;
+      }
+      if (skeletonPresent && livePresent) {
+        return "mixed";
+      }
+      if (skeletonPresent) {
+        return "approximate";
+      }
+      return "live";
+    };
+
+    setKeyLevelState((prev) => {
+      const nextHighPrice = hasHigh ? high : prev.currentDayHigh.price;
+      const nextLowPrice = hasLow ? low : prev.currentDayLow.price;
+      const nextVwapPrice = vwapValue !== null ? vwapValue : prev.sessionVwap.price;
+
+      const nextHighStatus = nextHighPrice === null
+        ? "unavailable"
+        : statusFor(hasHigh, prev.currentDayHigh.status);
+      const nextLowStatus = nextLowPrice === null
+        ? "unavailable"
+        : statusFor(hasLow, prev.currentDayLow.status);
+      const nextVwapStatus = nextVwapPrice === null
+        ? "unavailable"
+        : statusFor(vwapValue !== null, prev.sessionVwap.status);
+
+      if (
+        nextHighPrice === prev.currentDayHigh.price &&
+        nextLowPrice === prev.currentDayLow.price &&
+        nextVwapPrice === prev.sessionVwap.price &&
+        nextHighStatus === prev.currentDayHigh.status &&
+        nextLowStatus === prev.currentDayLow.status &&
+        nextVwapStatus === prev.sessionVwap.status
+      ) {
+        return prev;
+      }
+
+      return {
+        ...prev,
+        currentDayHigh: {
+          price: nextHighPrice,
+          status: nextHighStatus,
+        },
+        currentDayLow: {
+          price: nextLowPrice,
+          status: nextLowStatus,
+        },
+        sessionVwap: {
+          price: nextVwapPrice,
+          status: nextVwapStatus,
+        },
+      };
+    });
+  }, [bars]);
 
   const signalControlRef = useRef<SignalControlState>(signalControl);
   const tradingEngineRef = useRef<TradingEngine | null>(null);
@@ -341,6 +821,13 @@ export function useFootprint() {
   const modeRef = useRef<FootprintMode>("live");
   const replayStateRef = useRef<ReplayState>(INITIAL_REPLAY_STATE);
   const datasetMetricsCacheRef = useRef<Map<string, ReplayMetrics>>(new Map());
+  const seedContextRef = useRef<{
+    symbol: string;
+    timeframe: Timeframe;
+    seeds: HistoricalFootprintBarSeed[];
+    sessionStart: number;
+  } | null>(null);
+  const sessionStartRef = useRef<number | null>(null);
 
   const syncServerTime = useCallback(async () => {
     try {
@@ -784,11 +1271,13 @@ export function useFootprint() {
     });
 
     workerReadyRef.current = true;
+    setWorkerReady(true);
 
     return () => {
       worker.terminate();
       workerRef.current = null;
       workerReadyRef.current = false;
+      setWorkerReady(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -953,6 +1442,9 @@ export function useFootprint() {
     recoveringRef.current = false;
     wasEverConnectedRef.current = false;
     reconnectAttemptsRef.current = 0;
+    seedContextRef.current = null;
+    sessionStartRef.current = null;
+    setKeyLevelState(INITIAL_KEY_LEVEL_STATE);
     setConnectionDiagnostics((prev) => ({
       ...prev,
       reconnectAttempts: 0,
@@ -1165,6 +1657,30 @@ export function useFootprint() {
     setSettings((prev) => ({
       ...prev,
       showCumulativeDelta: !prev.showCumulativeDelta,
+    }));
+  }, []);
+
+  const toggleGrid = useCallback(() => {
+    setSettings((prev) => ({
+      ...prev,
+      showGrid: !prev.showGrid,
+    }));
+  }, []);
+
+  const togglePriceAxis = useCallback(() => {
+    setSettings((prev) => ({
+      ...prev,
+      showPriceAxis: !prev.showPriceAxis,
+    }));
+  }, []);
+
+  const toggleKeyLevelVisibility = useCallback((key: keyof KeyLevelVisibility) => {
+    setSettings((prev) => ({
+      ...prev,
+      keyLevelVisibility: {
+        ...prev.keyLevelVisibility,
+        [key]: !prev.keyLevelVisibility[key],
+      },
     }));
   }, []);
 
@@ -1518,10 +2034,17 @@ export function useFootprint() {
     signalStats,
     signalControl,
     settings,
+    chartKeyLevels,
+    keyLevelState,
+    keyLevelSummaries,
+    statusNotices,
     updateSettings,
     setTimeframe,
     setPriceStep,
     toggleCumulativeDelta,
+    toggleGrid,
+    togglePriceAxis,
+    toggleKeyLevelVisibility,
     setSignalMode,
     toggleStrategy,
     updateSignalOverrides,

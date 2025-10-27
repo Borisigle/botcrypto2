@@ -3,11 +3,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type {
+  ChartKeyLevel,
   FootprintBar,
   FootprintSignal,
   HoverInfo,
   InvalidationEvent,
   InvalidationSeverity,
+  KeyLevelStatus,
   PendingTrade,
   Position,
 } from "@/types";
@@ -22,6 +24,10 @@ interface FootprintChartProps {
   invalidations: InvalidationEvent[];
   priceStep: number;
   priceBounds: { min: number; max: number; maxVolume: number } | null;
+  keyLevels: ChartKeyLevel[];
+  showGrid: boolean;
+  showPriceAxis: boolean;
+  tickSize: number;
   onHover: (hover: HoverInfo | null, position?: { x: number; y: number }) => void;
 }
 
@@ -34,7 +40,85 @@ const INVALIDATION_COLORS: Record<InvalidationSeverity, { active: string; inacti
   low: { active: "rgba(56, 189, 248, 0.9)", inactive: "rgba(56, 189, 248, 0.35)" },
 };
 
-export function FootprintChart({ bars, signals, positions, pendingTrades, invalidations, priceStep, priceBounds, onHover }: FootprintChartProps) {
+const PRICE_AXIS_WIDTH = 72;
+const CURRENT_PRICE_COLOR = "rgba(248, 250, 252, 0.92)";
+const CURRENT_PRICE_BG = "rgba(59, 130, 246, 0.22)";
+const AXIS_BACKGROUND = "rgba(10, 12, 23, 0.95)";
+const AXIS_TICK_COLOR = "rgba(226, 232, 240, 0.72)";
+const AXIS_TICK_MARK_COLOR = "rgba(148, 163, 184, 0.4)";
+
+const KEY_LEVEL_STYLES: Record<ChartKeyLevel["type"], { stroke: string; label: string }> = {
+  pdh: { stroke: "rgba(250, 204, 21, 1)", label: "rgba(250, 204, 21, 0.16)" },
+  pdl: { stroke: "rgba(59, 130, 246, 1)", label: "rgba(59, 130, 246, 0.16)" },
+  "session-vwap": { stroke: "rgba(192, 132, 252, 1)", label: "rgba(192, 132, 252, 0.18)" },
+  "session-high": { stroke: "rgba(14, 165, 233, 1)", label: "rgba(14, 165, 233, 0.18)" },
+  "session-low": { stroke: "rgba(34, 197, 94, 1)", label: "rgba(34, 197, 94, 0.18)" },
+  "current-high": { stroke: "rgba(34, 197, 94, 1)", label: "rgba(34, 197, 94, 0.18)" },
+  "current-low": { stroke: "rgba(239, 68, 68, 1)", label: "rgba(239, 68, 68, 0.18)" },
+  "prior-day-poc": { stroke: "rgba(148, 163, 184, 1)", label: "rgba(148, 163, 184, 0.18)" },
+};
+
+const KEY_LEVEL_STATUS_ALPHA: Record<KeyLevelStatus, number> = {
+  live: 0.95,
+  mixed: 0.8,
+  approximate: 0.6,
+  unavailable: 0.3,
+};
+
+const KEY_LEVEL_STATUS_DASH: Record<KeyLevelStatus, number[] | undefined> = {
+  live: undefined,
+  mixed: [10, 4],
+  approximate: [6, 4],
+  unavailable: [2, 6],
+};
+
+function computeAxisTicks(min: number, max: number, tickSize: number, desired = 6): number[] {
+  if (!Number.isFinite(min) || !Number.isFinite(max) || min >= max || tickSize <= 0) {
+    return [];
+  }
+  const range = max - min;
+  const baseStep = tickSize;
+  const multipliers = [1, 2, 2.5, 5];
+  let step = baseStep;
+  let multiplierIndex = 0;
+
+  while (range / step > desired && multiplierIndex < 32) {
+    const factor = multipliers[multiplierIndex % multipliers.length];
+    step *= factor;
+    multiplierIndex += 1;
+  }
+
+  const precision = precisionFromStep(tickSize);
+  const start = Math.ceil(min / step) * step;
+  const ticks: number[] = [];
+
+  for (let price = start; price <= max + step; price += step) {
+    const value = Number(price.toFixed(precision));
+    if (value >= min - step * 0.5 && value <= max + step * 0.5) {
+      ticks.push(value);
+    }
+    if (ticks.length > desired + 8) {
+      break;
+    }
+  }
+
+  return ticks;
+}
+
+export function FootprintChart({
+  bars,
+  signals,
+  positions,
+  pendingTrades,
+  invalidations,
+  priceStep,
+  priceBounds,
+  keyLevels,
+  showGrid,
+  showPriceAxis,
+  tickSize,
+  onHover,
+}: FootprintChartProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const signalPositionsRef = useRef<
@@ -43,6 +127,7 @@ export function FootprintChart({ bars, signals, positions, pendingTrades, invali
   const [size, setSize] = useState({ width: 0, height: 0 });
 
   const precision = useMemo(() => precisionFromStep(priceStep), [priceStep]);
+  const tickPrecision = useMemo(() => precisionFromStep(tickSize), [tickSize]);
   const barIndexByTime = useMemo(() => {
     const map = new Map<number, number>();
     for (let i = 0; i < bars.length; i += 1) {
