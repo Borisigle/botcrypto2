@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { __testDispatchAggTradeMessage } from "@/lib/binance";
+import { clampDepthLimit, __testDispatchAggTradeMessage } from "@/lib/binance";
 
 function createAggTradeMessage(): string {
   return JSON.stringify({
@@ -43,5 +43,33 @@ describe("BinanceAggTradeStream dispatch guard", () => {
     expect(warnSpy).not.toHaveBeenCalled();
 
     warnSpy.mockRestore();
+  });
+});
+
+describe("clampDepthLimit", () => {
+  it("defaults to 100 when limit is undefined", () => {
+    expect(clampDepthLimit()).toBe(100);
+  });
+
+  it("rounds to the nearest allowed value", () => {
+    expect(clampDepthLimit(7)).toBe(5);
+    expect(clampDepthLimit(9)).toBe(10);
+    expect(clampDepthLimit(55)).toBe(50);
+    expect(clampDepthLimit(600)).toBe(500);
+  });
+
+  it("prefers the higher bound when equidistant", () => {
+    expect(clampDepthLimit(15)).toBe(20);
+    expect(clampDepthLimit(75)).toBe(100);
+  });
+
+  it("clamps to the allowed range", () => {
+    expect(clampDepthLimit(-10)).toBe(5);
+    expect(clampDepthLimit(9999)).toBe(1000);
+  });
+
+  it("keeps existing allowed values intact", () => {
+    expect(clampDepthLimit(500)).toBe(500);
+    expect(clampDepthLimit(1000)).toBe(1000);
   });
 });

@@ -259,6 +259,7 @@ export function useFootprint() {
   const [depth, setDepth] = useState<DepthState | null>(null);
   const [depthStatus, setDepthStatus] =
     useState<ConnectionStatus>("connecting");
+  const [depthStatusMeta, setDepthStatusMeta] = useState<StreamStatusMeta | null>(null);
 
   const priceBounds = useMemo<PriceBounds | null>(() => {
     if (!bars.length) {
@@ -1013,6 +1014,7 @@ export function useFootprint() {
       depthBufferRef.current = [];
       setDepth(null);
       setDepthStatus("disconnected");
+      setDepthStatusMeta(null);
       return () => {};
     }
 
@@ -1030,18 +1032,24 @@ export function useFootprint() {
             depthFlushTimerRef.current = window.setTimeout(() => flushDepthUpdates(true), 80);
           }
         },
-        onStatusChange: (status) => {
+        onStatusChange: (status, meta) => {
           setDepthStatus(status);
+          if (meta?.scope === "snapshot") {
+            setDepthStatusMeta({ ...meta });
+          } else if (status === "disconnected") {
+            setDepthStatusMeta(null);
+          }
         },
         onError: (message) => {
           setLastError((prev) => prev ?? message);
         },
       },
-      { levels: 120, snapshotIntervalMs: 60_000 },
+      { levels: 100, snapshotIntervalMs: 60_000 },
     );
 
     depthStreamRef.current = stream;
     setDepthStatus("connecting");
+    setDepthStatusMeta(null);
     stream.connect();
 
     return () => {
@@ -1518,6 +1526,8 @@ export function useFootprint() {
     toggleStrategy,
     updateSignalOverrides,
     connectionStatus,
+    depthStatus,
+    depthStatusMeta,
     priceBounds,
     lastError,
     tradingState,

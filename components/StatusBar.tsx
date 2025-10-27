@@ -1,3 +1,4 @@
+import type { StreamStatusMeta } from "@/lib/binance";
 import type {
   ConnectionDiagnostics,
   ConnectionStatus,
@@ -16,6 +17,8 @@ interface StatusBarProps {
   barsCount: number;
   diagnostics: ConnectionDiagnostics;
   guardrails: RiskGuardrailState;
+  depthStatus: ConnectionStatus;
+  depthMeta?: StreamStatusMeta | null;
   lastError?: string | null;
 }
 
@@ -48,6 +51,8 @@ export function StatusBar({
   barsCount,
   diagnostics,
   guardrails,
+  depthStatus,
+  depthMeta,
   lastError,
 }: StatusBarProps) {
   const statusMeta = STATUS_STYLES[status];
@@ -61,6 +66,11 @@ export function StatusBar({
   const guardrailReason = guardrails.status === "ok"
     ? null
     : guardrails.activeBlocks[0]?.reason ?? guardrails.lastBlock?.reason ?? null;
+  const depthStatusMetaResolved = depthMeta ?? null;
+  const depthStatusInfo = STATUS_STYLES[depthStatus];
+  const depthMessage = depthStatusMetaResolved?.message ?? null;
+  const depthAttempts = depthStatusMetaResolved?.attempts ?? 0;
+  const depthMessageClass = getDepthMessageClass(depthStatusMetaResolved?.level);
 
   return (
     <footer className="flex flex-col gap-1 rounded-lg border border-white/5 bg-black/30 px-4 py-3 text-sm text-white/70">
@@ -110,6 +120,16 @@ export function StatusBar({
             {diagnostics.reconnectAttempts}
           </span>
         </span>
+        <span className="flex items-center gap-2">
+          <span className="font-semibold text-white/80">Depth</span>
+          <span className="flex items-center gap-1 font-medium text-white">
+            <span
+              className={`inline-flex h-2.5 w-2.5 rounded-full ${depthStatusInfo.className}`}
+              aria-hidden
+            />
+            <span className="font-mono text-white/60">{depthStatusInfo.label}</span>
+          </span>
+        </span>
       </div>
       {guardrailReason ? (
         <p className={`text-xs ${guardrailMeta.reasonClass}`}>Guardrail: {guardrailReason}</p>
@@ -123,11 +143,30 @@ export function StatusBar({
             : ""}
         </p>
       ) : null}
+      {depthMessage ? (
+        <p className={`text-xs ${depthMessageClass}`}>
+          {depthMessage}
+          {depthAttempts > 1 ? ` (attempt ${depthAttempts})` : ""}
+        </p>
+      ) : null}
       {lastError ? (
         <p className="text-xs text-rose-300/80">{lastError}</p>
       ) : null}
     </footer>
   );
+}
+
+function getDepthMessageClass(level?: StreamStatusMeta["level"]): string {
+  switch (level) {
+    case "success":
+      return "text-emerald-300/80";
+    case "warning":
+      return "text-amber-300/80";
+    case "error":
+      return "text-rose-300/80";
+    default:
+      return "text-sky-300/80";
+  }
 }
 
 function formatOffset(offsetMs: number): string {

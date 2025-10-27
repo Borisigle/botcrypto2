@@ -91,7 +91,7 @@ const DEFAULT_THRESHOLDS: DepthThresholds = {
   spoofSizeThreshold: 40,
 };
 
-const DEFAULT_DEPTH_LEVELS = 120;
+const DEFAULT_DEPTH_LEVELS = 100;
 const OFI_WINDOW_MS = 3_000;
 const QUANTITY_EPSILON = 1e-9;
 const SPOOF_DISTANCE_TICKS = 5;

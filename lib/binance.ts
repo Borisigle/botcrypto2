@@ -5,9 +5,37 @@ const REST_BASE = "https://fapi.binance.com/fapi/v1";
 const MAX_BACKOFF = 30_000;
 const MAX_AGG_TRADE_LIMIT = 1000;
 
+export const ALLOWED_DEPTH_LIMITS = [5, 10, 20, 50, 100, 500, 1000] as const;
+type AllowedDepthLimit = (typeof ALLOWED_DEPTH_LIMITS)[number];
+const DEFAULT_DEPTH_LIMIT: AllowedDepthLimit = 100;
+
+export function clampDepthLimit(limit?: number | null): AllowedDepthLimit {
+  const numeric = Number(limit);
+  if (!Number.isFinite(numeric)) {
+    return DEFAULT_DEPTH_LIMIT;
+  }
+  const value = Math.max(1, Math.floor(numeric));
+  let best = ALLOWED_DEPTH_LIMITS[0];
+  let bestDiff = Math.abs(best - value);
+
+  for (const candidate of ALLOWED_DEPTH_LIMITS) {
+    const diff = Math.abs(candidate - value);
+    if (diff < bestDiff || (diff === bestDiff && candidate > best)) {
+      best = candidate;
+      bestDiff = diff;
+    }
+  }
+
+  return best;
+}
+
 export interface StreamStatusMeta {
   attempts?: number;
   nextRetryMs?: number;
+  scope?: "ws" | "snapshot";
+  level?: "success" | "info" | "warning" | "error";
+  message?: string;
+  statusCode?: number;
 }
 
 export interface WSHandlers {
@@ -236,6 +264,18 @@ interface DepthSnapshotResponse {
   asks?: Array<[string, string]>;
 }
 
+export class DepthSnapshotError extends Error {
+  status?: number;
+
+  constructor(status?: number, message?: string) {
+    super(message ?? (status ? `Depth snapshot error ${status}` : "Depth snapshot error"));
+    this.name = "DepthSnapshotError";
+    if (Number.isFinite(status ?? NaN)) {
+      this.status = status ?? undefined;
+    }
+  }
+}
+
 export interface FetchAggTradesParams {
   symbol: string;
   startTime?: number;
@@ -334,16 +374,24 @@ export async function fetchSymbolMarketConfig(symbol: string): Promise<SymbolMar
   };
 }
 
-export async function fetchDepthSnapshot(symbol: string, limit = 120): Promise<DepthSnapshot> {
+export async function fetchDepthSnapshot(symbol: string, limit?: number): Promise<DepthSnapshot> {
   ensureFetch();
   const url = new URL(`${REST_BASE}/depth`);
+  const depthLimit = clampDepthLimit(limit);
   url.searchParams.set("symbol", symbol.toUpperCase());
-  const depthLimit = Math.min(Math.max(Math.floor(limit), 5), 1000);
   url.searchParams.set("limit", String(depthLimit));
 
-  const response = await fetch(url.toString());
+  let response: Response;
+  try {
+    response = await fetch(url.toString());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new DepthSnapshotError(undefined, message);
+  }
+
   if (!response.ok) {
-    throw new Error(`Failed to fetch Binance depth snapshot: ${response.status}`);
+    const status = response.status;
+    throw new DepthSnapshotError(status, `Depth snapshot error ${status}`);
   }
 
   const payload = (await response.json()) as DepthSnapshotResponse;
