@@ -18,7 +18,7 @@ export class DepthGapError extends Error {
   }
 }
 
-const DEFAULT_MAX_LEVELS = 120;
+const DEFAULT_MAX_LEVELS = 100;
 const QUANTITY_EPSILON = 1e-9;
 
 export class DepthOrderBook {

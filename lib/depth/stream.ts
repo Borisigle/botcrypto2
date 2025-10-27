@@ -1,6 +1,6 @@
 import type { ConnectionStatus, DepthSnapshot, DepthStreamMessage } from "@/types";
 
-import { fetchDepthSnapshot, type StreamStatusMeta } from "@/lib/binance";
+import { clampDepthLimit, DepthSnapshotError, fetchDepthSnapshot, type StreamStatusMeta } from "@/lib/binance";
 
 interface DepthStreamHandlers {
   onMessage: (message: DepthStreamMessage) => void;
@@ -17,6 +17,7 @@ const STREAM_BASE = "wss://fstream.binance.com/stream?streams=";
 const MAX_BACKOFF = 30_000;
 const DEFAULT_SNAPSHOT_INTERVAL = 60_000;
 const MAX_BUFFERED_DIFFS = 800;
+const SNAPSHOT_BACKOFF_STEPS = [1_000, 2_000, 5_000, 10_000, 30_000];
 
 export class BinanceDepthStream {
   private ws: WebSocket | null = null;
@@ -49,10 +50,14 @@ export class BinanceDepthStream {
 
   private fetchingSnapshot = false;
 
+  private snapshotAttempts = 0;
+
+  private nextSnapshotDue: number | null = null;
+
   constructor(symbol: string, handlers: DepthStreamHandlers, options?: DepthStreamOptions) {
     this.symbol = symbol.toUpperCase();
     this.handlers = handlers;
-    this.levelLimit = Math.max(10, Math.floor(options?.levels ?? 120));
+    this.levelLimit = clampDepthLimit(options?.levels);
     this.snapshotIntervalMs = Math.max(15_000, options?.snapshotIntervalMs ?? DEFAULT_SNAPSHOT_INTERVAL);
     this.url = buildStreamUrl(this.symbol);
   }
@@ -60,6 +65,8 @@ export class BinanceDepthStream {
   connect() {
     this.shouldReconnect = true;
     this.reconnectAttempts = 0;
+    this.snapshotAttempts = 0;
+    this.nextSnapshotDue = null;
     this.openConnection();
   }
 
@@ -69,7 +76,9 @@ export class BinanceDepthStream {
     this.ws?.close();
     this.ws = null;
     this.synced = false;
-    this.setStatus("disconnected");
+    this.snapshotAttempts = 0;
+    this.nextSnapshotDue = null;
+    this.setStatus("disconnected", { scope: "ws", attempts: this.reconnectAttempts });
   }
 
   updateSymbol(symbol: string) {
@@ -82,6 +91,8 @@ export class BinanceDepthStream {
     this.synced = false;
     this.lastUpdateId = 0;
     this.pendingDiffs = [];
+    this.snapshotAttempts = 0;
+    this.nextSnapshotDue = null;
     this.disconnect();
     this.connect();
   }
@@ -89,7 +100,7 @@ export class BinanceDepthStream {
   private openConnection() {
     this.clearTimers();
     const phase: ConnectionStatus = this.reconnectAttempts === 0 ? "connecting" : "reconnecting";
-    this.setStatus(phase, { attempts: this.reconnectAttempts });
+    this.setStatus(phase, { attempts: this.reconnectAttempts, scope: "ws" });
 
     try {
       this.ws = new WebSocket(this.url);
@@ -102,12 +113,12 @@ export class BinanceDepthStream {
     this.ws.onopen = () => {
       const attempts = this.reconnectAttempts;
       this.reconnectAttempts = 0;
-      this.setStatus("connected", { attempts });
+      this.setStatus("connected", { attempts, scope: "ws" });
       this.synced = false;
       this.lastUpdateId = 0;
       this.pendingDiffs = [];
-      void this.fetchSnapshot();
-      this.scheduleSnapshotRefresh();
+      this.snapshotAttempts = 0;
+      this.scheduleSnapshotFetch(0);
     };
 
     this.ws.onmessage = (event) => {
@@ -129,7 +140,7 @@ export class BinanceDepthStream {
     };
 
     this.ws.onerror = () => {
-      this.setStatus("reconnecting", { attempts: this.reconnectAttempts });
+      this.setStatus("reconnecting", { attempts: this.reconnectAttempts, scope: "ws" });
       this.ws?.close();
     };
 
@@ -138,7 +149,7 @@ export class BinanceDepthStream {
       if (this.shouldReconnect) {
         this.scheduleReconnect();
       } else {
-        this.setStatus("disconnected", { attempts: this.reconnectAttempts });
+        this.setStatus("disconnected", { attempts: this.reconnectAttempts, scope: "ws" });
       }
     };
   }
@@ -149,33 +160,118 @@ export class BinanceDepthStream {
     this.setStatus("reconnecting", {
       attempts: this.reconnectAttempts,
       nextRetryMs: delay,
+      scope: "ws",
     });
     this.clearTimers();
     this.reconnectTimer = window.setTimeout(() => this.openConnection(), delay);
   }
 
-  private scheduleSnapshotRefresh() {
-    this.clearSnapshotTimer();
+  private scheduleSnapshotFetch(delayMs: number) {
+    const delay = Number.isFinite(delayMs) ? Math.max(0, Math.floor(delayMs)) : this.snapshotIntervalMs;
+    const now = Date.now();
+    const due = now + delay;
+
+    if (this.snapshotTimer !== null && this.nextSnapshotDue !== null) {
+      if (due >= this.nextSnapshotDue) {
+        return;
+      }
+      window.clearTimeout(this.snapshotTimer);
+    }
+
     this.snapshotTimer = window.setTimeout(() => {
+      this.snapshotTimer = null;
+      this.nextSnapshotDue = null;
       void this.fetchSnapshot();
-      this.scheduleSnapshotRefresh();
-    }, this.snapshotIntervalMs);
+    }, delay);
+    this.nextSnapshotDue = due;
   }
 
   private async fetchSnapshot() {
     if (this.fetchingSnapshot) {
       return;
     }
+
     this.fetchingSnapshot = true;
+
     try {
       const snapshot = await fetchDepthSnapshot(this.symbol, this.levelLimit);
       this.applySnapshot(snapshot);
+      this.snapshotAttempts = 0;
+      const refreshDelay = this.snapshotIntervalMs;
+      this.emitSnapshotStatus({
+        level: "success",
+        message: `Depth snapshot OK — refresh in ${formatDuration(refreshDelay)}`,
+        nextRetryMs: refreshDelay,
+        attempts: this.snapshotAttempts,
+      });
+      this.scheduleSnapshotFetch(refreshDelay);
     } catch (error) {
-      this.handlers.onError?.(toMessage(error));
       this.synced = false;
+      const delay = this.nextSnapshotDelay();
+      const attempts = this.snapshotAttempts;
+      const statusCode = error instanceof DepthSnapshotError ? error.status : undefined;
+      const message = statusCode
+        ? `Depth snapshot error ${statusCode} — retry in ${formatDuration(delay)}`
+        : `Depth snapshot failed — retry in ${formatDuration(delay)}`;
+      this.logSnapshotWarning(message, error);
+      this.emitSnapshotStatus({
+        level: "error",
+        message,
+        nextRetryMs: delay,
+        attempts,
+        statusCode,
+      });
+      if (attempts === 1) {
+        this.handlers.onError?.(message);
+      }
+      this.scheduleSnapshotFetch(delay);
     } finally {
       this.fetchingSnapshot = false;
     }
+  }
+
+  private nextSnapshotDelay(): number {
+    const index = Math.min(this.snapshotAttempts, SNAPSHOT_BACKOFF_STEPS.length - 1);
+    const delay = SNAPSHOT_BACKOFF_STEPS[index];
+    this.snapshotAttempts += 1;
+    return delay;
+  }
+
+  private emitSnapshotStatus(meta: Partial<StreamStatusMeta>) {
+    this.setStatus(this.status, {
+      scope: "snapshot",
+      ...meta,
+    });
+  }
+
+  private logSnapshotWarning(message: string, error?: unknown) {
+    if (error instanceof Error) {
+      if (error.message && error.message !== message) {
+        console.warn(`[depth] ${message} (${error.message})`);
+      } else {
+        console.warn(`[depth] ${message}`);
+      }
+      return;
+    }
+    if (error !== undefined) {
+      console.warn(`[depth] ${message}`, error);
+      return;
+    }
+    console.warn(`[depth] ${message}`);
+  }
+
+  private ensureSnapshotScheduled() {
+    if (this.fetchingSnapshot) {
+      return;
+    }
+    if (this.snapshotAttempts > 0) {
+      if (this.snapshotTimer === null) {
+        const index = Math.min(this.snapshotAttempts, SNAPSHOT_BACKOFF_STEPS.length - 1);
+        this.scheduleSnapshotFetch(SNAPSHOT_BACKOFF_STEPS[index]);
+      }
+      return;
+    }
+    this.scheduleSnapshotFetch(0);
   }
 
   private applySnapshot(snapshot: DepthSnapshot) {
@@ -210,9 +306,7 @@ export class BinanceDepthStream {
       if (this.pendingDiffs.length > MAX_BUFFERED_DIFFS) {
         this.pendingDiffs.splice(0, this.pendingDiffs.length - MAX_BUFFERED_DIFFS);
       }
-      if (!this.fetchingSnapshot) {
-        void this.fetchSnapshot();
-      }
+      this.ensureSnapshotScheduled();
       return;
     }
     if (message.type === "diff") {
@@ -245,7 +339,7 @@ export class BinanceDepthStream {
     this.synced = false;
     this.lastUpdateId = 0;
     this.pendingDiffs = [];
-    void this.fetchSnapshot();
+    this.ensureSnapshotScheduled();
   }
 
   private setStatus(status: ConnectionStatus, meta?: StreamStatusMeta) {
@@ -269,6 +363,7 @@ export class BinanceDepthStream {
       window.clearTimeout(this.snapshotTimer);
       this.snapshotTimer = null;
     }
+    this.nextSnapshotDue = null;
   }
 }
 
@@ -327,6 +422,25 @@ function toDepthLevel(entry: unknown): { price: number; quantity: number } | nul
     return null;
   }
   return { price, quantity };
+}
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return "0s";
+  }
+  if (ms < 1_000) {
+    return `${Math.round(ms)}ms`;
+  }
+  if (ms < 60_000) {
+    const seconds = ms / 1_000;
+    return Number.isInteger(seconds) ? `${seconds}s` : `${seconds.toFixed(1)}s`;
+  }
+  if (ms < 3_600_000) {
+    const minutes = ms / 60_000;
+    return Number.isInteger(minutes) ? `${minutes}m` : `${minutes.toFixed(1)}m`;
+  }
+  const hours = ms / 3_600_000;
+  return Number.isInteger(hours) ? `${hours}h` : `${hours.toFixed(1)}h`;
 }
 
 function toMessage(error: unknown): string {

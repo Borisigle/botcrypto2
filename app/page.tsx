@@ -28,6 +28,8 @@ export default function Page() {
     toggleStrategy: toggleSignalStrategy,
     updateSignalOverrides,
     connectionStatus,
+    depthStatus,
+    depthStatusMeta,
     priceBounds,
     lastError,
     tradingState,
@@ -174,6 +176,8 @@ export default function Page() {
         barsCount={bars.length}
         diagnostics={connectionDiagnostics}
         guardrails={tradingState.guardrails}
+        depthStatus={depthStatus}
+        depthMeta={depthStatusMeta}
         lastError={lastError}
       />
     </main>
