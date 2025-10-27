@@ -7,6 +7,7 @@ import type {
   FootprintBar,
   FootprintSignal,
   FootprintState,
+  HistoricalFootprintBarSeed,
   LevelBin,
   SignalControlState,
   SignalStats,
@@ -38,6 +39,7 @@ interface InternalBar {
   lowPrice: number;
   openPrice: number | null;
   closePrice: number | null;
+  skeleton: boolean;
   depth?: DepthBarMetrics | null;
 }
 
@@ -230,6 +232,132 @@ export class FootprintAggregator {
     return this.buildState(bars);
   }
 
+  seedSkeletonBars(seeds: HistoricalFootprintBarSeed[]) {
+    if (!Array.isArray(seeds) || !seeds.length) {
+      return;
+    }
+
+    const timeframeMs = this.settings.timeframeMs;
+    if (!Number.isFinite(timeframeMs) || timeframeMs <= 0) {
+      return;
+    }
+
+    type NormalizedSeed = {
+      startTime: number;
+      endTime: number;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    };
+
+    const normalized: NormalizedSeed[] = [];
+
+    for (const seed of seeds) {
+      if (!seed) {
+        continue;
+      }
+      const startCandidate = Number(seed.startTime);
+      const open = Number(seed.open);
+      const highRaw = Number(seed.high);
+      const lowRaw = Number(seed.low);
+      const close = Number(seed.close);
+      const volumeRaw = Number(seed.volume);
+
+      if (
+        !Number.isFinite(startCandidate) ||
+        !Number.isFinite(open) ||
+        !Number.isFinite(highRaw) ||
+        !Number.isFinite(lowRaw) ||
+        !Number.isFinite(close)
+      ) {
+        continue;
+      }
+
+      const startTime = Math.floor(Math.trunc(startCandidate) / timeframeMs) * timeframeMs;
+      const endTime = startTime + timeframeMs;
+      const high = Math.max(highRaw, lowRaw);
+      const low = Math.min(highRaw, lowRaw);
+      const volume = Number.isFinite(volumeRaw) ? Math.max(0, volumeRaw) : 0;
+
+      normalized.push({
+        startTime,
+        endTime,
+        open,
+        high,
+        low,
+        close,
+        volume,
+      });
+    }
+
+    if (!normalized.length) {
+      return;
+    }
+
+    normalized.sort((a, b) => a.startTime - b.startTime);
+
+    this.signalEngine.reset();
+    this.signals = [];
+    this.signalStats = createInitialSignalStats();
+
+    const priceStep = this.settings.priceStep;
+    const precision = this.precision;
+    const MAX_SKELETON_LEVELS = 3000;
+
+    for (const item of normalized) {
+      const bar = this.getOrCreateBar(item.startTime, item.endTime);
+      bar.levels.clear();
+      bar.totalDelta = 0;
+      bar.pocPrice = null;
+      bar.pocVolume = 0;
+      bar.totalVolume = item.volume;
+      bar.highPrice = item.high;
+      bar.lowPrice = item.low;
+      bar.openPrice = item.open;
+      bar.closePrice = item.close;
+      bar.skeleton = true;
+      bar.depth = null;
+
+      if (priceStep > 0 && Number.isFinite(item.low) && Number.isFinite(item.high) && item.high >= item.low) {
+        const startPrice = item.low;
+        const endPrice = item.high;
+        const rawSteps = Math.max(0, Math.floor((endPrice - startPrice) / priceStep));
+        const cappedSteps = Math.min(rawSteps, MAX_SKELETON_LEVELS);
+
+        for (let index = 0; index <= cappedSteps; index += 1) {
+          const price = Number((startPrice + index * priceStep).toFixed(precision));
+          if (!Number.isFinite(price)) {
+            continue;
+          }
+          bar.levels.set(price, {
+            price,
+            askVol: 0,
+            bidVol: 0,
+            totalVolume: 0,
+          });
+        }
+
+        const shouldIncludeEnd = cappedSteps < rawSteps || cappedSteps === 0;
+        if (shouldIncludeEnd) {
+          const price = Number(endPrice.toFixed(precision));
+          if (Number.isFinite(price)) {
+            bar.levels.set(price, {
+              price,
+              askVol: 0,
+              bidVol: 0,
+              totalVolume: 0,
+            });
+          }
+        }
+      }
+    }
+
+    this.bars.sort((a, b) => a.startTime - b.startTime);
+    this.prune();
+  }
+
   private buildState(bars: FootprintBar[]): FootprintState {
     return {
       bars,
@@ -315,6 +443,7 @@ export class FootprintAggregator {
         lowPrice: Number(lowPrice.toFixed(6)),
         openPrice: Number(openPrice.toFixed(6)),
         closePrice: Number(closePrice.toFixed(6)),
+        skeleton: bar.skeleton,
         depth: bar.depth ?? null,
       });
     }
@@ -341,6 +470,7 @@ export class FootprintAggregator {
     const barStart = Math.floor(trade.timestamp / timeframeMs) * timeframeMs;
     const barEnd = barStart + timeframeMs;
     const bar = this.getOrCreateBar(barStart, barEnd);
+    bar.skeleton = false;
 
     if (bar.openPrice === null) {
       bar.openPrice = trade.price;
@@ -401,6 +531,8 @@ export class FootprintAggregator {
       lowPrice: Number.POSITIVE_INFINITY,
       openPrice: null,
       closePrice: null,
+      skeleton: false,
+      depth: null,
     };
 
     this.barMap.set(startTime, bar);

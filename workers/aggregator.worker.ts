@@ -3,7 +3,13 @@
 import { FootprintAggregator, timeframeToMs } from "@/lib/aggregator";
 import type { AggregatorSettings } from "@/lib/aggregator";
 import { createDefaultSignalControlState } from "@/lib/signals";
-import type { DepthStreamMessage, FootprintState, SignalControlState, Trade } from "@/types";
+import type {
+  DepthStreamMessage,
+  FootprintState,
+  HistoricalFootprintBarSeed,
+  SignalControlState,
+  Trade,
+} from "@/types";
 
 interface InitMessage {
   type: "init";
@@ -31,11 +37,23 @@ interface DepthMessage {
   updates: DepthStreamMessage[];
 }
 
+interface SeedMessage {
+  type: "seed";
+  seeds: HistoricalFootprintBarSeed[];
+}
+
 interface ClearMessage {
   type: "clear";
 }
 
-type WorkerMessage = InitMessage | TradesMessage | SettingsMessage | DetectorConfigMessage | DepthMessage | ClearMessage;
+type WorkerMessage =
+  | InitMessage
+  | TradesMessage
+  | SettingsMessage
+  | DetectorConfigMessage
+  | DepthMessage
+  | SeedMessage
+  | ClearMessage;
 
 type WorkerSettings = {
   timeframe: string;
@@ -115,6 +133,16 @@ ctx.onmessage = (event: MessageEvent<WorkerMessage>) => {
           aggregator = createAggregator(currentSettings, detectorConfig);
         }
         sendState(aggregator.ingestDepth(message.updates));
+        break;
+      case "seed":
+        if (!aggregator) {
+          if (!currentSettings) {
+            return;
+          }
+          aggregator = createAggregator(currentSettings, detectorConfig);
+        }
+        aggregator.seedSkeletonBars(Array.isArray(message.seeds) ? message.seeds : []);
+        sendState(aggregator.getState());
         break;
       case "clear":
         aggregator?.reset();

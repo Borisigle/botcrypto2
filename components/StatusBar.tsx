@@ -20,6 +20,7 @@ interface StatusBarProps {
   depthStatus: ConnectionStatus;
   depthMeta?: StreamStatusMeta | null;
   lastError?: string | null;
+  notices?: string[];
 }
 
 const STATUS_STYLES: Record<
@@ -54,6 +55,7 @@ export function StatusBar({
   depthStatus,
   depthMeta,
   lastError,
+  notices,
 }: StatusBarProps) {
   const statusMeta = STATUS_STYLES[status];
   const offsetLabel = formatOffset(diagnostics.serverTimeOffsetMs);
@@ -71,6 +73,7 @@ export function StatusBar({
   const depthMessage = depthStatusMetaResolved?.message ?? null;
   const depthAttempts = depthStatusMetaResolved?.attempts ?? 0;
   const depthMessageClass = getDepthMessageClass(depthStatusMetaResolved?.level);
+  const latestNotice = notices?.[0] ?? null;
 
   return (
     <footer className="flex flex-col gap-1 rounded-lg border border-white/5 bg-black/30 px-4 py-3 text-sm text-white/70">
@@ -142,6 +145,9 @@ export function StatusBar({
             ? ` • ${gapTrades} trade${gapTrades === 1 ? "" : "s"}`
             : ""}
         </p>
+      ) : null}
+      {latestNotice ? (
+        <p className="text-xs text-emerald-300/80">{latestNotice}</p>
       ) : null}
       {depthMessage ? (
         <p className={`text-xs ${depthMessageClass}`}>

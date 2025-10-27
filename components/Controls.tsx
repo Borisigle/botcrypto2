@@ -7,6 +7,8 @@ import { MODE_PRESETS } from "@/lib/signals";
 import type {
   DetectorOverrides,
   FootprintMode,
+  KeyLevelStatus,
+  KeyLevelVisibility,
   RecordingDatasetSummary,
   ReplayMetrics,
   ReplaySpeed,
@@ -24,6 +26,10 @@ interface ControlsProps {
   priceStep: number;
   priceStepConfig: { min: number; max: number; step: number };
   showCumulativeDelta: boolean;
+  showGrid: boolean;
+  showPriceAxis: boolean;
+  keyLevelVisibility: KeyLevelVisibility;
+  keyLevelSummaries: Record<keyof KeyLevelVisibility, KeyLevelStatus>;
   signalControl: SignalControlState;
   signalStats: SignalStats;
   mode: FootprintMode;
@@ -39,6 +45,9 @@ interface ControlsProps {
   onTimeframeChange: (timeframe: Timeframe) => void;
   onPriceStepChange: (step: number) => void;
   onToggleCumulativeDelta: () => void;
+  onToggleGrid: () => void;
+  onTogglePriceAxis: () => void;
+  onToggleKeyLevels: (group: keyof KeyLevelVisibility) => void;
   onModeChange: (mode: SignalMode) => void;
   onToggleStrategy: (strategy: SignalStrategy) => void;
   onOverridesChange: (overrides: Partial<DetectorOverrides>) => void;
@@ -59,6 +68,10 @@ export function Controls({
   priceStep,
   priceStepConfig,
   showCumulativeDelta,
+  showGrid,
+  showPriceAxis,
+  keyLevelVisibility,
+  keyLevelSummaries,
   signalControl,
   signalStats,
   mode,
@@ -74,6 +87,9 @@ export function Controls({
   onTimeframeChange,
   onPriceStepChange,
   onToggleCumulativeDelta,
+  onToggleGrid,
+  onTogglePriceAxis,
+  onToggleKeyLevels,
   onModeChange,
   onToggleStrategy,
   onOverridesChange,
@@ -402,10 +418,62 @@ export function Controls({
         Show cumulative delta
       </label>
 
+      <label className="flex items-center gap-3 text-sm text-white/80">
+        <input
+          type="checkbox"
+          checked={showGrid}
+          onChange={onToggleGrid}
+          className="h-4 w-4 accent-emerald-500"
+        />
+        Show grid
+      </label>
+
+      <label className="flex items-center gap-3 text-sm text-white/80">
+        <input
+          type="checkbox"
+          checked={showPriceAxis}
+          onChange={onTogglePriceAxis}
+          className="h-4 w-4 accent-emerald-500"
+        />
+        Show price axis
+      </label>
+
+      <div className="mt-3 h-px bg-white/10" />
+
+      <div className="flex flex-col gap-2">
+        <span className="text-sm font-semibold text-white/80">Key levels</span>
+        <div className="flex flex-col gap-2">
+          {([
+            { id: "previousDay" as const, label: "Previous day H/L" },
+            { id: "sessionVwap" as const, label: "Session VWAP" },
+            { id: "currentDay" as const, label: "Current day H/L" },
+            { id: "priorDayPoc" as const, label: "Prior day POC" },
+          ]).map((group) => (
+            <label
+              key={group.id}
+              className="flex items-center justify-between rounded-md border border-white/10 bg-black/40 px-3 py-2 text-sm text-white/70 hover:border-white/20"
+            >
+              <div className="flex flex-col">
+                <span>{group.label}</span>
+                <span className={`text-xs ${keyLevelStatusClass(keyLevelSummaries[group.id])}`}>
+                  {formatKeyLevelStatus(keyLevelSummaries[group.id])}
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                checked={keyLevelVisibility[group.id]}
+                onChange={() => onToggleKeyLevels(group.id)}
+                className="h-4 w-4 accent-emerald-500"
+              />
+            </label>
+          ))}
+        </div>
+      </div>
+
       <div className="mt-3 h-px bg-white/10" />
 
       <div className="flex flex-col gap-3 pt-2">
-        <div className="flex items-center justify-between">
+
           <span className="text-sm font-semibold text-white/80">
             Modo de señales
           </span>
@@ -566,6 +634,32 @@ function ThresholdSlider({
       />
     </div>
   );
+}
+
+function formatKeyLevelStatus(status: KeyLevelStatus): string {
+  switch (status) {
+    case "live":
+      return "Live";
+    case "mixed":
+      return "Mixed";
+    case "approximate":
+      return "Approx";
+    default:
+      return "N/A";
+  }
+}
+
+function keyLevelStatusClass(status: KeyLevelStatus): string {
+  switch (status) {
+    case "live":
+      return "text-emerald-300";
+    case "mixed":
+      return "text-amber-300";
+    case "approximate":
+      return "text-sky-300";
+    default:
+      return "text-slate-500";
+  }
 }
 
 function summarizeDataset(dataset: RecordingDatasetSummary | null): string {
