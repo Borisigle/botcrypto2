@@ -573,6 +573,24 @@ export function useFootprint() {
     [pushTrade],
   );
 
+  const handleStreamOpen = useCallback(() => {
+    setConnectionStatus("connected");
+    setLastError(null);
+  }, []);
+
+  const handleStreamClose = useCallback(() => {
+    setConnectionStatus((prev) =>
+      prev === "disconnected" ? prev : "reconnecting",
+    );
+  }, []);
+
+  const handleStreamError = useCallback((error: unknown) => {
+    const message =
+      error instanceof Error ? error.message : String(error);
+    console.error("[binance]", error);
+    setLastError(message);
+  }, []);
+
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
@@ -953,8 +971,13 @@ export function useFootprint() {
     }
 
     const stream = new BinanceAggTradeStream(settings.symbol, {
-      onStatusChange: handleStatusChange,
-      onError: (message) => setLastError(message),
+      handlers: {
+        onTrade: processIncomingTrade,
+        onStatusChange: handleStatusChange,
+        onError: handleStreamError,
+        onOpen: handleStreamOpen,
+        onClose: handleStreamClose,
+      },
     });
 
     streamRef.current = stream;
@@ -974,6 +997,9 @@ export function useFootprint() {
     settings.symbol,
     processIncomingTrade,
     handleStatusChange,
+    handleStreamError,
+    handleStreamOpen,
+    handleStreamClose,
     flushTrades,
   ]);
 

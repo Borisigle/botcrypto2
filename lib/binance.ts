@@ -10,10 +10,17 @@ export interface StreamStatusMeta {
   nextRetryMs?: number;
 }
 
-export interface StreamHandlers {
-  onTrade: (trade: Trade) => void;
+export interface WSHandlers {
+  onTrade?: (trade: Trade) => void;
+  onDepth?: (payload: unknown) => void;
   onStatusChange?: (status: ConnectionStatus, meta?: StreamStatusMeta) => void;
-  onError?: (message: string) => void;
+  onError?: (error: unknown) => void;
+  onOpen?: () => void;
+  onClose?: (event?: CloseEvent) => void;
+}
+
+interface BinanceAggTradeStreamOptions {
+  handlers?: WSHandlers;
 }
 
 export class BinanceAggTradeStream {
@@ -29,7 +36,11 @@ export class BinanceAggTradeStream {
 
   private readonly url: string;
 
-  constructor(symbol: string, private readonly handlers: StreamHandlers) {
+  private readonly handlers: WSHandlers;
+
+  constructor(symbol: string, options?: BinanceAggTradeStreamOptions) {
+    const opts = options ?? {};
+    this.handlers = opts.handlers ? { ...opts.handlers } : {};
     const streamKey = `${symbol.toLowerCase()}@aggTrade`;
     this.url = `${STREAM_BASE}${streamKey}`;
   }
@@ -50,6 +61,7 @@ export class BinanceAggTradeStream {
   }
 
   private openConnection() {
+    this.clearTimer();
     const phase: ConnectionStatus = this.reconnectAttempts === 0 ? "connecting" : "reconnecting";
     this.setStatus(phase, { attempts: this.reconnectAttempts });
 
@@ -57,6 +69,7 @@ export class BinanceAggTradeStream {
       this.ws = new WebSocket(this.url);
     } catch (error) {
       this.scheduleReconnect();
+      this.emitError(error);
       return;
     }
 
@@ -64,14 +77,12 @@ export class BinanceAggTradeStream {
       const attempts = this.reconnectAttempts;
       this.reconnectAttempts = 0;
       this.setStatus("connected", { attempts });
+      this.handleOpen();
     };
 
     this.ws.onmessage = (event) => {
       const dispatch = (raw: string) => {
-        const payload = parseAggTrade(raw);
-        if (payload) {
-          this.handlers.onTrade(payload);
-        }
+        this.dispatchMessage(raw);
       };
 
       if (typeof event.data === "string") {
@@ -81,23 +92,32 @@ export class BinanceAggTradeStream {
           .text()
           .then(dispatch)
           .catch((error) => {
-            this.handlers.onError?.(error instanceof Error ? error.message : String(error));
+            this.emitError(error);
           });
+      } else {
+        devWarn("[binance] Received unsupported WebSocket message type", event.data);
       }
     };
 
-    this.ws.onerror = () => {
+    this.ws.onerror = (event) => {
       this.setStatus("reconnecting", { attempts: this.reconnectAttempts });
+      const payload = event instanceof ErrorEvent ? event.error ?? event.message : event;
+      this.emitError(payload);
       this.ws?.close();
     };
 
-    this.ws.onclose = () => {
+    this.ws.onclose = (event) => {
+      this.handleClose(event);
       if (this.shouldReconnect) {
         this.scheduleReconnect();
       } else {
         this.setStatus("disconnected", { attempts: this.reconnectAttempts });
       }
     };
+  }
+
+  private dispatchMessage(raw: string) {
+    dispatchStreamMessage(raw, this.handlers, (error) => this.emitError(error));
   }
 
   private scheduleReconnect() {
@@ -131,7 +151,52 @@ export class BinanceAggTradeStream {
       payload.attempts = this.reconnectAttempts;
     }
 
-    this.handlers.onStatusChange?.(status, payload);
+    const handler = this.handlers.onStatusChange;
+    if (typeof handler === "function") {
+      try {
+        handler(status, payload);
+      } catch (error) {
+        this.emitError(error);
+      }
+    }
+  }
+
+  private handleOpen() {
+    const handler = this.handlers.onOpen;
+    if (typeof handler === "function") {
+      try {
+        handler();
+      } catch (error) {
+        this.emitError(error);
+      }
+    }
+  }
+
+  private handleClose(event?: CloseEvent) {
+    const handler = this.handlers.onClose;
+    if (typeof handler === "function") {
+      try {
+        handler(event);
+      } catch (error) {
+        this.emitError(error);
+      }
+    }
+  }
+
+  private emitError(error: unknown) {
+    const handler = this.handlers.onError;
+    if (typeof handler === "function") {
+      try {
+        handler(error);
+        return;
+      } catch (handlerError) {
+        devWarn("[binance] onError handler threw", handlerError);
+      }
+    }
+
+    if (!isProduction()) {
+      console.error("[binance] Stream error", error);
+    }
   }
 }
 
@@ -323,15 +388,11 @@ function mapDepthEntry(entry: [string, string]): DepthLevel | null {
   return { price, quantity };
 }
 
-function parseAggTrade(message: string): Trade | null {
-  try {
-    const parsed = JSON.parse(message);
-    const data: AggTradeResponse | undefined = parsed?.data;
-    return data ? mapAggTrade(data) : null;
-  } catch (error) {
-    console.error("Failed to parse aggTrade", error);
+function parseAggTrade(payload: unknown): Trade | null {
+  if (!isRecord(payload)) {
     return null;
   }
+  return mapAggTrade(payload as AggTradeResponse);
 }
 
 function mapAggTrade(data: AggTradeResponse): Trade | null {
@@ -373,5 +434,84 @@ function sanitizeStep(value: number | null, fallback: number, minimum?: number):
 function ensureFetch(): void {
   if (typeof fetch === "undefined") {
     throw new Error("Global fetch is not available in the current environment");
+  }
+}
+
+function dispatchStreamMessage(raw: string, handlers: WSHandlers, emitError: (error: unknown) => void): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    emitError(error);
+    return;
+  }
+
+  const envelope = isRecord(parsed) ? parsed : null;
+  const stream = typeof envelope?.["stream"] === "string" ? (envelope["stream"] as string) : undefined;
+  const dataCandidate = envelope && "data" in envelope ? envelope["data"] : parsed;
+
+  if (!isRecord(dataCandidate)) {
+    return;
+  }
+
+  const record = dataCandidate;
+  const eventType = typeof record["e"] === "string" ? (record["e"] as string) : undefined;
+
+  if (eventType === "aggTrade" || (stream && stream.includes("@aggTrade"))) {
+    const trade = parseAggTrade(record);
+    if (!trade) {
+      return;
+    }
+    const handler = handlers.onTrade;
+    if (typeof handler === "function") {
+      try {
+        handler(trade);
+      } catch (error) {
+        emitError(error);
+      }
+    } else {
+      devWarn("[binance] Dropped aggTrade message because onTrade handler is not a function.");
+    }
+    return;
+  }
+
+  if (eventType === "depthUpdate" || (stream && stream.includes("@depth"))) {
+    const handler = handlers.onDepth;
+    if (typeof handler === "function") {
+      try {
+        handler(record);
+      } catch (error) {
+        emitError(error);
+      }
+    } else {
+      devWarn("[binance] Dropped depth message because onDepth handler is not a function.");
+    }
+  }
+}
+
+export function __testDispatchAggTradeMessage(
+  raw: string,
+  handlers?: WSHandlers,
+  emitError?: (error: unknown) => void,
+): void {
+  dispatchStreamMessage(raw, handlers ?? {}, emitError ?? (() => {}));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isProduction(): boolean {
+  return typeof process !== "undefined" && process.env?.NODE_ENV === "production";
+}
+
+function devWarn(message: string, ...args: unknown[]): void {
+  if (isProduction()) {
+    return;
+  }
+  if (args.length) {
+    console.warn(message, ...args);
+  } else {
+    console.warn(message);
   }
 }
