@@ -392,6 +392,11 @@ export interface FootprintSignal {
   strategy: SignalStrategy;
   strategies: SignalStrategy[];
   levelLabel: string | null;
+  keyLevel: {
+    label: string;
+    price: number;
+    distancePercent: number;
+  } | null;
   evidence: SignalEvidenceItem[];
   l2?: {
     confirmed: boolean;
@@ -579,6 +584,7 @@ export interface Position {
   side: SignalSide;
   strategy: SignalStrategy;
   session: TradingSession;
+  auto: boolean;
   entryPrice: number;
   entryFillPrice: number;
   originalStop: number;
@@ -646,7 +652,40 @@ export interface DailyPerformance {
   byStrategy: Record<SignalStrategy, SummaryStats>;
 }
 
-export interface TradingTimelineEntry {
+export type TradingTimelinePhase =
+  | "signal"
+  | "pending"
+  | "entry"
+  | "tp1-be"
+  | "tp2"
+  | "stop"
+  | "breakeven"
+  | "time-stop"
+  | "cancelled"
+  | "rejected"
+  | "invalidation";
+
+export interface TradingTimelineTradeEntry {
+  id: string;
+  timestamp: number;
+  type: "trade";
+  signalId: string;
+  positionId?: string | null;
+  phase: TradingTimelinePhase;
+  label: string;
+  side: SignalSide;
+  auto: boolean;
+  entry?: number;
+  stop?: number;
+  target1?: number;
+  target2?: number;
+  price?: number;
+  result?: TradeResult;
+  exitReason?: TradeExitReason;
+  note?: string;
+}
+
+export interface TradingTimelineInvalidationEntry {
   id: string;
   timestamp: number;
   type: "invalidation";
@@ -663,6 +702,8 @@ export interface TradingTimelineEntry {
   resolvedAt?: number;
   thesisSummary?: string;
 }
+
+export type TradingTimelineEntry = TradingTimelineInvalidationEntry | TradingTimelineTradeEntry;
 
 export interface TradingState {
   settings: TradingSettings;

@@ -75,11 +75,11 @@ const DEFAULT_OBJECTIVE_INVALIDATION_SETTINGS: ObjectiveInvalidationSettings = {
   timeDecayContraBars: 2,
   timeDecayDeltaThreshold: 0.4,
   timeDecayOfiThreshold: 50,
-  autoCloseSevere: true,
+  autoCloseSevere: false,
 };
 
 const DEFAULT_TRADING_SETTINGS: TradingSettings = {
-  autoTake: false,
+  autoTake: true,
   riskPerTradePercent: 1,
   feesPercent: 0.01,
   slippageTicks: 0.5,
@@ -499,6 +499,8 @@ export class TradingEngine {
 
   private timeline: TradingTimelineEntry[] = [];
 
+  private timelineSeq = 0;
+
   private lastBars: FootprintBar[] = [];
 
   private positionMeta = new Map<string, PositionMeta>();
@@ -688,6 +690,20 @@ export class TradingEngine {
       if (!existing) {
         newSignals.push(signal);
         changed = true;
+        this.logTradeEvent({
+          signalId: signal.id,
+          positionId: null,
+          phase: "signal",
+          timestamp: signal.timestamp,
+          side: signal.side,
+          auto: this.settings.autoTake,
+          label: "Señal detectada",
+          note: signal.keyLevel ? `Nivel ${signal.keyLevel.label}` : undefined,
+          entry: signal.entry,
+          stop: signal.stop,
+          target1: signal.target1,
+          target2: signal.target2,
+        });
         if (this.settings.autoTake) {
           const { pending, guardrailsChanged } = this.createPendingFromSignal(signal, true);
           if (pending) {
@@ -791,6 +807,20 @@ export class TradingEngine {
       for (let index = this.pending.length - 1; index >= 0; index -= 1) {
         const pending = this.pending[index];
         if (trade.timestamp >= pending.expiresAt) {
+          this.logTradeEvent({
+            signalId: pending.signalId,
+            positionId: null,
+            phase: "cancelled",
+            timestamp: pending.expiresAt,
+            side: pending.side,
+            auto: pending.auto,
+            label: "Pendiente expirado",
+            note: "Ventana de retest agotada",
+            entry: pending.entry,
+            stop: pending.stop,
+            target1: pending.target1,
+            target2: pending.target2,
+          });
           this.pending.splice(index, 1);
           changed = true;
           continue;
@@ -804,6 +834,20 @@ export class TradingEngine {
           const position = this.openPositionFromPending(pending, trade);
           if (position) {
             this.positions.push(position);
+            this.logTradeEvent({
+              signalId: position.signalId,
+              positionId: position.id,
+              phase: "entry",
+              timestamp: position.entryTime,
+              side: position.side,
+              auto: pending.auto,
+              label: "Entrada ejecutada",
+              price: position.entryFillPrice,
+              entry: position.entryPrice,
+              stop: position.stopPrice,
+              target1: position.target1,
+              target2: position.target2,
+            });
             changed = true;
           }
         }
@@ -1073,8 +1117,39 @@ export class TradingEngine {
       return { pending: null, guardrailsChanged: evaluation.changed };
     }
 
-    const target1 = Number((signal.entry + direction * riskPerUnit * 2).toFixed(6));
-    const target2 = Number((signal.entry + direction * riskPerUnit * 3).toFixed(6));
+    const target1Price = signal.entry + direction * riskPerUnit * 2;
+    const target2Price = signal.entry + direction * riskPerUnit * 3;
+
+    const keyLevel = signal.keyLevel;
+    if (keyLevel && Number.isFinite(keyLevel.price)) {
+      const levelPrice = keyLevel.price;
+      let blocked = false;
+      if (direction > 0) {
+        blocked = levelPrice > signal.entry + PRICE_EPSILON && levelPrice < target1Price - PRICE_EPSILON;
+      } else {
+        blocked = levelPrice < signal.entry - PRICE_EPSILON && levelPrice > target1Price + PRICE_EPSILON;
+      }
+      if (blocked) {
+        this.logTradeEvent({
+          signalId: signal.id,
+          positionId: null,
+          phase: "rejected",
+          timestamp: signal.timestamp,
+          side: signal.side,
+          auto,
+          label: "Descartada < 2R",
+          note: `Nivel ${keyLevel.label} bloquea antes de 2R`,
+          entry: signal.entry,
+          stop: signal.stop,
+          target1: Number(target1Price.toFixed(6)),
+          target2: Number(target2Price.toFixed(6)),
+        });
+        return { pending: null, guardrailsChanged: evaluation.changed };
+      }
+    }
+
+    const target1 = Number(target1Price.toFixed(6));
+    const target2 = Number(target2Price.toFixed(6));
 
     const retestWindow = Math.max(0, this.settings.retestWindowMinutes) * 60_000;
     const pending: PendingTrade = {
@@ -1095,6 +1170,20 @@ export class TradingEngine {
     };
 
     this.pending.push(pending);
+    this.logTradeEvent({
+      signalId: signal.id,
+      positionId: null,
+      phase: "pending",
+      timestamp: pending.createdAt,
+      side: signal.side,
+      auto,
+      label: auto ? "Auto-sim pendiente" : "Pendiente manual",
+      note: this.settings.retestWindowMinutes ? `Ventana ${Math.round(this.settings.retestWindowMinutes)}m` : undefined,
+      entry: pending.entry,
+      stop: pending.stop,
+      target1: pending.target1,
+      target2: pending.target2,
+    });
     return { pending, guardrailsChanged: evaluation.changed };
   }
 
@@ -1128,6 +1217,7 @@ export class TradingEngine {
       side: pending.side,
       strategy: pending.strategy,
       session: pending.session,
+      auto: pending.auto,
       entryPrice: pending.entry,
       entryFillPrice: fillPrice,
       originalStop: pending.stop,
@@ -1245,6 +1335,21 @@ export class TradingEngine {
       position.target1Hit = true;
       position.firstHit = position.firstHit === "none" ? "tp1" : position.firstHit;
       position.stopPrice = this.computeBreakEvenStop(position);
+      this.logTradeEvent({
+        signalId: position.signalId,
+        positionId: position.id,
+        phase: "tp1-be",
+        timestamp: trade.timestamp,
+        side: position.side,
+        auto: position.auto,
+        label: "TP1 ejecutado",
+        note: "50% cerrado y SL a BE",
+        price: trade.price,
+        entry: position.entryPrice,
+        stop: position.stopPrice,
+        target1: position.target1,
+        target2: position.target2,
+      });
       return true;
     }
 
@@ -1265,6 +1370,21 @@ export class TradingEngine {
       position.firstHit = "tp1";
     }
     position.stopPrice = this.computeBreakEvenStop(position);
+    this.logTradeEvent({
+      signalId: position.signalId,
+      positionId: position.id,
+      phase: "tp1-be",
+      timestamp: trade.timestamp,
+      side: position.side,
+      auto: position.auto,
+      label: "TP1 ejecutado",
+      note: "50% cerrado y SL a BE",
+      price: exitFill,
+      entry: position.entryPrice,
+      stop: position.stopPrice,
+      target1: position.target1,
+      target2: position.target2,
+    });
     return true;
   }
 
@@ -2026,6 +2146,66 @@ export class TradingEngine {
     }
 
     return event;
+  }
+
+  private pushTimeline(entry: TradingTimelineEntry): void {
+    this.pushTimeline(entry);
+  }
+
+  private logTradeEvent(params: {
+    signalId: string;
+    positionId?: string | null;
+    phase: TradingTimelinePhase;
+    timestamp: number;
+    side: SignalSide;
+    auto: boolean;
+    label: string;
+    note?: string;
+    entry?: number;
+    stop?: number;
+    target1?: number;
+    target2?: number;
+    price?: number;
+    result?: TradeResult;
+    exitReason?: TradeExitReason;
+  }): void {
+    this.timelineSeq += 1;
+    const entry: TradingTimelineTradeEntry = {
+      id: `${params.signalId}-${params.phase}-${this.timelineSeq}`,
+      type: "trade",
+      timestamp: params.timestamp,
+      signalId: params.signalId,
+      positionId: params.positionId ?? null,
+      phase: params.phase,
+      label: params.label,
+      side: params.side,
+      auto: params.auto,
+    };
+    if (typeof params.entry === "number") {
+      entry.entry = params.entry;
+    }
+    if (typeof params.stop === "number") {
+      entry.stop = params.stop;
+    }
+    if (typeof params.target1 === "number") {
+      entry.target1 = params.target1;
+    }
+    if (typeof params.target2 === "number") {
+      entry.target2 = params.target2;
+    }
+    if (typeof params.price === "number") {
+      entry.price = params.price;
+    }
+    if (params.note) {
+      entry.note = params.note;
+    }
+    if (params.result) {
+      entry.result = params.result;
+    }
+    if (params.exitReason) {
+      entry.exitReason = params.exitReason;
+    }
+    this.pushTimeline(entry);
   }
 
   private appendTimelineForEvent(event: InvalidationEvent, position: Position): void {
