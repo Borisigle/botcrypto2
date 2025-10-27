@@ -473,15 +473,12 @@ export function Controls({
       <div className="mt-3 h-px bg-white/10" />
 
       <div className="flex flex-col gap-3 pt-2">
-
-          <span className="text-sm font-semibold text-white/80">
-            Modo de señales
-          </span>
-          <span className="text-xs text-slate-400">
-            ≈ {estimatedPerDay.toFixed(1)} señales/día
-          </span>
-        </div>
-
+        <span className="text-sm font-semibold text-white/80">
+          Modo de señales
+        </span>
+        <span className="text-xs text-slate-400">
+          ≈ {estimatedPerDay.toFixed(1)} señales/día
+        </span>
         <select
           value={signalControl.mode}
           onChange={(event) => onModeChange(event.target.value as SignalMode)}
